@@ -21,19 +21,46 @@
 # environment name and is shown as the ad-hoc case.
 #
 # Usage:
-#   fm-cursor.sh list  [--json] [--all] [--limit <n>] [--no-runs] [--env [<name>]]
-#   fm-cursor.sh show  <agent-id> [--json]
-#   fm-cursor.sh runs  <agent-id> [--json] [--limit <n>]
-#   fm-cursor.sh usage <agent-id> [--json]
+#   fm-cursor.sh list   [--json] [--all] [--limit <n>] [--no-runs] [--env [<name>]]
+#   fm-cursor.sh show   <agent-id> [--json]
+#   fm-cursor.sh runs   <agent-id> [--json] [--limit <n>]
+#   fm-cursor.sh usage  <agent-id> [--json]
+#   fm-cursor.sh send   <agent-id> <prompt...> [--json]
+#   fm-cursor.sh cancel <agent-id> [--json]
+#   fm-cursor.sh archive <agent-id> [--json]
+#   fm-cursor.sh unarchive <agent-id> [--json]
+#   fm-cursor.sh create [--env <name>] (--prompt <text> | --prompt-file <path>)
+#                       [--model <id>] [--json]
 #   fm-cursor.sh -h | --help
 #
-# Subcommands:
+# Read subcommands:
 #   list   Agents newest-first, each with its ENVIRONMENT and the status of its
 #          LATEST RUN. Archived agents are hidden unless --all is passed.
 #   show   One agent's detail: its environment, every repository in that
 #          environment, and the status of its latest run.
 #   runs   Run history for one agent: status, start, duration, and any PR URL.
-#   usage  Token usage for one agent, totalled and per run.
+#   usage  Token usage for one agent: the totals and the run count. The per-run
+#          breakdown is in --json only.
+#
+# Mutating subcommands, which act on the operator's LIVE fleet:
+#   send      Queue a follow-up run on an existing agent.
+#   cancel    Cancel that agent's active run.
+#   archive   Archive an agent. Reversible; `unarchive` brings it back.
+#   unarchive Restore an archived agent.
+#   create    Start a new agent in an environment.
+#
+# Every mutating subcommand requires an explicit agent id: there is no "most
+# recent" default and no wildcard, because steering the wrong agent is not undone
+# by re-running the command. `DELETE /v1/agents/{id}` is deliberately NOT wired at
+# all - it is permanent, `archive` covers every cleanup need, and `unarchive`
+# makes it reversible.
+#
+# One run can be active per agent, so `send`, `cancel` and `archive` read the
+# latest run status first and refuse with an explanation naming the run rather
+# than firing a request the API would answer with `409 agent_busy`. A run that
+# starts between that read and the write still yields a clean refusal, not a
+# stack trace. When the run status cannot be determined at all, they refuse
+# rather than risk interrupting live work.
 #
 # Options:
 #   --json        Emit a stable JSON document instead of the human table.
@@ -71,7 +98,11 @@
 # that field is NOT in Cursor's published schema, so a per-agent
 # `runs?limit=1` fallback covers both its absence AND a fast path whose request
 # fails, and the JSON output records which source answered in `runStatusSource`:
-# `latestRunId`, `runs-list`, `resolution-failed`, or `skipped` for --no-runs.
+# `latestRunId`, `runs-list`, `resolution-failed`, `none` for an agent that has no
+# runs at all, or `skipped` for --no-runs. An agent with no runs reports run
+# status `none`, which is a real observation - the agent exists and has never run -
+# and is distinct from `unknown`, which means resolution failed and the run's state
+# was never seen.
 # Run resolution is deliberately NON-FATAL, in `show` exactly as in `list`. The
 # fast path is reached through that undocumented field, so a stale value there
 # says nothing about whether the agent exists, and exiting with "not found" for an
@@ -123,6 +154,8 @@
 #   3  not configured (no CURSOR_API_KEY), misconfigured (a key or timeout this
 #      helper refuses to hand to curl), or a required tool is missing
 #   4  the API rejected or failed the request
+#   5  refused on purpose: the agent is busy, has nothing to act on, or its state
+#      could not be determined, so no request was sent
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -163,9 +196,11 @@ default_environment() {
 
 CFG=
 BODY=
+REQ=
 cleanup() {
   [ -z "$CFG" ] || rm -f -- "$CFG"
   [ -z "$BODY" ] || rm -f -- "$BODY"
+  [ -z "$REQ" ] || rm -f -- "$REQ"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -255,6 +290,66 @@ api_try_get() {  # <path>
 # show: every top-level fetch, including the `list` page itself.
 api_get() {  # <path>
   api_try_get "$1" || die 4 "$API_ERROR"
+}
+
+# POST <path> [json-body-file]; same credential path and error shaping as the GET
+# helpers. Accepts 200 and 201, since create returns 201. Returns non-zero with
+# $API_ERROR set rather than exiting, because the mutating callers turn a 409 into
+# a clean refusal instead of an error.
+#
+# Request bodies are always built with `jq -n --arg`, never by interpolating text
+# into a JSON string: a prompt is arbitrary operator text and would otherwise be
+# able to close the quote and inject fields.
+api_try_post() {  # <path> [body-file]
+  local path=$1 body_file=${2:-} code
+  API_ERROR=
+  if [ -n "$body_file" ]; then
+    code=$(curl --config "$CFG" -X POST -H 'Content-Type: application/json' \
+      --data-binary "@$body_file" -o "$BODY" -w '%{http_code}' "$API_BASE$path" 2>/dev/null) || code=000
+  else
+    code=$(curl --config "$CFG" -X POST -o "$BODY" -w '%{http_code}' \
+      "$API_BASE$path" 2>/dev/null) || code=000
+  fi
+  case $code in
+    200|201) return 0 ;;
+    000) API_ERROR="could not reach ${API_BASE} (network, proxy, or timeout after ${TIMEOUT}s)" ;;
+    400) API_ERROR="the Cursor API rejected the request (HTTP 400)$(api_message)" ;;
+    401|403) API_ERROR="the Cursor API rejected the key (HTTP $code)$(api_message). Check CURSOR_API_KEY, or regenerate it at https://cursor.com/dashboard/api" ;;
+    404) API_ERROR="not found (HTTP 404)$(api_message)" ;;
+    409) API_ERROR="conflict (HTTP 409)$(api_message)" ;;
+    429) API_ERROR="rate limited by the Cursor API (HTTP 429)$(api_message). Retry in a minute" ;;
+    *) API_ERROR="the Cursor API returned HTTP $code$(api_message)" ;;
+  esac
+  API_ERROR=${API_ERROR//$'\n'/ }
+  API_ERROR=${API_ERROR//$'\r'/ }
+  API_ERROR=${API_ERROR//$'\t'/ }
+  API_ERROR=${API_ERROR//$'\037'/ }
+  API_HTTP_CODE=$code
+  return 1
+}
+API_HTTP_CODE=
+
+# A scratch file for a request body, removed with the rest of the private files.
+new_body_file() {
+  umask 077
+  REQ=$(mktemp "${TMPDIR:-/tmp}/.fm-cursor-req.XXXXXX") \
+    || die 3 "could not create a private file for the request body"
+  chmod 600 "$REQ" || die 3 "could not restrict permissions on the request body file"
+}
+
+# Refuse to act on an agent whose run is still going. One run can be active per
+# agent, so the API would answer 409 agent_busy; reading first turns that into an
+# explanation naming the run instead of a failed request. A caller still handles a
+# real 409, because the run can start between this read and the write.
+refuse_if_busy() {  # <agent-id> <verb>
+  local agent=$1 verb=$2
+  read_run_status_record "$(latest_run_status "$agent" "")"
+  case $RUN_STATUS in
+    RUNNING|CREATING)
+      die 5 "agent $agent is busy: its latest run ${RUN_ID} is $RUN_STATUS, and only one run can be active at a time. Wait for it to finish, or cancel it first, then $verb again." ;;
+    unknown)
+      die 5 "cannot tell whether agent $agent is busy: $RUN_REASON. Refusing to $verb rather than risk interrupting a live run." ;;
+  esac
 }
 
 # The API's own error text, when the body is JSON carrying one. Never the body
@@ -535,11 +630,22 @@ EOF
   # Truncate the environment label first, then append the default marker, so a
   # long environment name can never swallow the marker the way it would if the
   # assembled label were cut to width.
-  printf '%s' "$resolved" | jq -r --arg defaultEnv "$default_env" '
+  printf '%s' "$resolved" | jq -r --arg defaultEnv "$default_env" --arg sep "$sep" '
     def trunc($w): if length > $w then .[0:($w - 3)] + "..." else . end;
+    # `.name` and `.envName` are API-controlled strings, so they get the same
+    # treatment api_try_get gives the API message field before it enters a
+    # separator-delimited record: a name carrying the record separator, a newline,
+    # CR or tab would otherwise split or truncate the row it appears in.
+    #
+    # The separator is split on literally, via jq`s one-argument split and the
+    # separator passed in as $sep, rather than named by an escape inside a regex
+    # character class. `[\\u001f...]` does NOT mean U+001F there - it is a literal
+    # backslash plus `u`, so the class silently matches the letters u, n, r, t and
+    # the digits 0, 1, f, which turns "cloud" into "clo d".
+    def clean: split($sep) | join(" ") | gsub("[\n\r\t]"; " ");
     .[]
-    | ((if .envName != "" then .envName
-        else "(ad-hoc " + (if .envType != "" then .envType else "cloud" end) + ")" end)
+    | ((if .envName != "" then (.envName | clean)
+        else "(ad-hoc " + (if .envType != "" then (.envType | clean) else "cloud" end) + ")" end)
        | trunc(18)) as $envl
     | [
         .id,
@@ -548,7 +654,7 @@ EOF
         (.updatedAt | gsub("T"; " ") | .[0:16]),
         (if $defaultEnv != "" and .envName == $defaultEnv then $envl + " *" else $envl end),
         (.repos | length | tostring),
-        (.name | trunc(34))
+        (.name | clean | trunc(34))
       ] | join("\u001f")' |
   while IFS="$sep" read -r id run life upd envl repos name; do
     if [ "$include_archived" = true ]; then
@@ -561,7 +667,18 @@ EOF
   done
 
   echo
-  printf '%s agent(s) shown, %s with a run in flight' "$count" "$running"
+  # Only ever claim an in-flight count for runs actually OBSERVED. Under
+  # --no-runs nothing was resolved, and a degraded row's run was never seen, so
+  # asserting "0 with a run in flight" in either case would let an unresolved or
+  # unknown row read as idle - the exact misread this view exists to prevent, and
+  # the one the skill forbids folding into a "nothing running" count.
+  printf '%s agent(s) shown' "$count"
+  if [ "$resolve_runs" -eq 0 ]; then
+    printf ', none of whose runs were resolved'
+  else
+    printf ', %s observed with a run in flight' "$running"
+    [ "$unresolved" -eq 0 ] || printf ' and %s whose run could not be observed' "$unresolved"
+  fi
   [ "$named" -eq 0 ] || printf ', across %s named environment(s)' "$named"
   printf '.\n'
   if [ "$filtering" -eq 1 ]; then
@@ -780,13 +897,237 @@ cmd_usage() {
   echo 'Cursor reports tokens only; this API exposes no cost figure, so firstmate cannot report spend here.'
 }
 
+# --- mutating verbs ---------------------------------------------------------
+#
+# These four act on the operator's live fleet, so each requires an explicit agent
+# id. There is deliberately no "most recent" default and no wildcard: steering the
+# wrong agent is not recoverable by re-running a command.
+
+cmd_send() {
+  local json=0 agent='' text=''
+  while [ "$#" -gt 0 ]; do
+    case $1 in
+      --json) json=1 ;;
+      --) shift; break ;;
+      -*) die 2 "unknown option for send: $1" ;;
+      *)
+        if [ -z "$agent" ]; then
+          agent=$1
+        else
+          text=${text:+$text }$1
+        fi
+        ;;
+    esac
+    shift
+  done
+  while [ "$#" -gt 0 ]; do
+    text=${text:+$text }$1
+    shift
+  done
+  [ -n "$agent" ] || die 2 "send needs an agent id and a prompt (see: fm-cursor.sh list)"
+  valid_agent_id "$agent" || die 2 "not a valid agent id: $agent"
+  [ -n "$text" ] || die 2 "send needs prompt text after the agent id"
+
+  refuse_if_busy "$agent" send
+
+  new_body_file
+  # NOTE: `mcpServers` is deliberately ABSENT from this body and must stay absent.
+  # The API documents follow-up definitions as REPLACING the agent's create-time
+  # inline MCP servers for that run, so sending any list here silently strips
+  # every server not in it and the agent loses tools mid-conversation with no
+  # error. Omitting the field is the correct default, not an oversight.
+  jq -n --arg t "$text" '{prompt: {text: $t}}' > "$REQ" \
+    || die 3 "could not build the request body"
+
+  if ! api_try_post "/v1/agents/$agent/runs" "$REQ"; then
+    if [ "${API_HTTP_CODE:-}" = 409 ]; then
+      die 5 "agent $agent became busy between the check and the send: $API_ERROR. Nothing was sent; retry once its run finishes."
+    fi
+    die 4 "$API_ERROR"
+  fi
+
+  if [ "$json" -eq 1 ]; then
+    jq --arg a "$agent" '{schema: "fm-cursor-send.v1", agentId: $a, run: .}' "$BODY"
+    return 0
+  fi
+  printf 'Sent a follow-up to %s.\n' "$agent"
+  printf '  run    %s\n' "$(jq -r '(.id // .run.id) // "-"' "$BODY")"
+  printf '  status %s\n' "$(jq -r '(.status // .run.status) // "-"' "$BODY")"
+  echo 'The run is now the agent'"'"'s active one; watch it with runs, and no further follow-up can be sent until it finishes.'
+}
+
+cmd_cancel() {
+  local json=0 agent=''
+  while [ "$#" -gt 0 ]; do
+    case $1 in
+      --json) json=1 ;;
+      -*) die 2 "unknown option for cancel: $1" ;;
+      *)
+        [ -z "$agent" ] || die 2 "cancel takes exactly one agent id"
+        agent=$1
+        ;;
+    esac
+    shift
+  done
+  [ -n "$agent" ] || die 2 "cancel needs an agent id (see: fm-cursor.sh list)"
+  valid_agent_id "$agent" || die 2 "not a valid agent id: $agent"
+
+  read_run_status_record "$(latest_run_status "$agent" "")"
+  case $RUN_STATUS in
+    RUNNING|CREATING) ;;
+    unknown) die 5 "cannot tell what agent $agent is doing: $RUN_REASON. Refusing to cancel blind." ;;
+    none) die 5 "agent $agent has no runs to cancel." ;;
+    *) die 5 "agent $agent has nothing to cancel: its latest run ${RUN_ID} is already $RUN_STATUS." ;;
+  esac
+
+  if ! api_try_post "/v1/agents/$agent/runs/$RUN_ID/cancel"; then
+    die 4 "$API_ERROR"
+  fi
+  if [ "$json" -eq 1 ]; then
+    jq -n --arg a "$agent" --arg r "$RUN_ID" \
+      '{schema: "fm-cursor-cancel.v1", agentId: $a, runId: $r, cancelled: true}'
+    return 0
+  fi
+  printf 'Cancelled run %s on agent %s.\n' "$RUN_ID" "$agent"
+  echo 'Work the run had already pushed stays on its branch; cancelling stops the run, it does not undo commits.'
+}
+
+# archive/unarchive are the reversible lifecycle pair, and the only cleanup this
+# helper offers. DELETE /v1/agents/{id} is deliberately NOT wired: it is permanent
+# and nothing here needs it.
+cmd_archive() {
+  archive_verb archive "$@"
+}
+
+cmd_unarchive() {
+  archive_verb unarchive "$@"
+}
+
+archive_verb() {  # <archive|unarchive> <args...>
+  local verb=$1 json=0 agent=''
+  shift
+  while [ "$#" -gt 0 ]; do
+    case $1 in
+      --json) json=1 ;;
+      -*) die 2 "unknown option for $verb: $1" ;;
+      *)
+        [ -z "$agent" ] || die 2 "$verb takes exactly one agent id"
+        agent=$1
+        ;;
+    esac
+    shift
+  done
+  [ -n "$agent" ] || die 2 "$verb needs an agent id (see: fm-cursor.sh list)"
+  valid_agent_id "$agent" || die 2 "not a valid agent id: $agent"
+
+  if [ "$verb" = archive ]; then
+    refuse_if_busy "$agent" archive
+  fi
+
+  if ! api_try_post "/v1/agents/$agent/$verb"; then
+    die 4 "$API_ERROR"
+  fi
+  if [ "$json" -eq 1 ]; then
+    jq -n --arg a "$agent" --arg v "$verb" \
+      '{schema: "fm-cursor-archive.v1", agentId: $a, action: $v, ok: true}'
+    return 0
+  fi
+  if [ "$verb" = archive ]; then
+    printf 'Archived agent %s. This is reversible: unarchive brings it back.\n' "$agent"
+  else
+    printf 'Unarchived agent %s.\n' "$agent"
+  fi
+}
+
+cmd_create() {
+  local json=0 env_name='' prompt='' prompt_file='' model=''
+  while [ "$#" -gt 0 ]; do
+    case $1 in
+      --json) json=1 ;;
+      --env)
+        [ "$#" -ge 2 ] && [ -n "$2" ] || die 2 "--env needs an environment name"
+        env_name=$2; shift ;;
+      --env=*) env_name=${1#--env=}; [ -n "$env_name" ] || die 2 "--env= needs a name" ;;
+      --prompt)
+        [ "$#" -ge 2 ] && [ -n "$2" ] || die 2 "--prompt needs text"
+        prompt=$2; shift ;;
+      --prompt=*) prompt=${1#--prompt=} ;;
+      --prompt-file)
+        [ "$#" -ge 2 ] || die 2 "--prompt-file needs a path"
+        prompt_file=$2; shift ;;
+      --prompt-file=*) prompt_file=${1#--prompt-file=} ;;
+      --model)
+        [ "$#" -ge 2 ] && [ -n "$2" ] || die 2 "--model needs a model id"
+        model=$2; shift ;;
+      --model=*) model=${1#--model=} ;;
+      *) die 2 "unknown option for create: $1" ;;
+    esac
+    shift
+  done
+
+  [ -z "$prompt" ] || [ -z "$prompt_file" ] || die 2 "pass either --prompt or --prompt-file, not both"
+  if [ -n "$prompt_file" ]; then
+    [ -f "$prompt_file" ] || die 2 "no such prompt file: $prompt_file"
+    prompt=$(cat "$prompt_file") || die 2 "could not read prompt file: $prompt_file"
+  fi
+  [ -n "$prompt" ] || die 2 "create needs --prompt <text> or --prompt-file <path>"
+
+  # The environment is the unit of work, so it defaults to this home's configured
+  # one rather than making the operator repeat it.
+  if [ -z "$env_name" ]; then
+    env_name=$(default_environment)
+    [ -n "$env_name" ] || die 2 "create needs --env <name>, or a default in $CONFIG/cursor-environment"
+  fi
+
+  # Validate the model against what the account actually offers rather than a
+  # hardcoded list, which would rot as Cursor's catalog changes.
+  if [ -n "$model" ]; then
+    api_get "/v1/models"
+    if ! jq -e --arg m "$model" '[(.models // .items // [])[]
+          | if type == "object" then .id else . end] | index($m) != null' "$BODY" >/dev/null; then
+      die 2 "model '$model' is not in this account's catalog. Available: $(jq -r '[(.models // .items // [])[] | if type == "object" then .id else . end] | join(", ")' "$BODY")"
+    fi
+  fi
+
+  new_body_file
+  # `env` names the environment and `repos` is deliberately never sent: the API
+  # documents them as mutually exclusive, and the environment is what carries the
+  # predefined secrets and MCP configuration. Enumerating an environment's
+  # repositories instead would produce an agent that looks right and cannot
+  # authenticate.
+  if [ -n "$model" ]; then
+    jq -n --arg t "$prompt" --arg e "$env_name" --arg m "$model" \
+      '{prompt: {text: $t}, env: {type: "cloud", name: $e}, model: {id: $m}}' > "$REQ" \
+      || die 3 "could not build the request body"
+  else
+    jq -n --arg t "$prompt" --arg e "$env_name" \
+      '{prompt: {text: $t}, env: {type: "cloud", name: $e}}' > "$REQ" \
+      || die 3 "could not build the request body"
+  fi
+
+  api_try_post "/v1/agents" "$REQ" || die 4 "$API_ERROR"
+
+  if [ "$json" -eq 1 ]; then
+    jq --arg e "$env_name" '{schema: "fm-cursor-create.v1", environment: $e} + .' "$BODY"
+    return 0
+  fi
+  local id url
+  id=$(jq -r '(.agent.id // .id) // "-"' "$BODY")
+  url=$(jq -r '(.agent.url // .url) // "-"' "$BODY")
+  printf 'Created agent %s in environment %s.\n' "$id" "$env_name"
+  printf '  run    %s\n' "$(jq -r '(.run.id // .latestRunId) // "-"' "$BODY")"
+  printf '  status %s\n' "$(jq -r '(.run.status // .agent.status // .status) // "-"' "$BODY")"
+  printf '  url    %s\n' "$url"
+  echo 'Open the url to watch it in Cursor Web; steer it with send, and archive it when it is no longer wanted.'
+}
+
 [ "$#" -ge 1 ] || { usage >&2; exit 2; }
 SUB=$1
 shift
 case $SUB in
   -h|--help|help) usage; exit 0 ;;
-  list|show|runs|usage) ;;
-  *) die 2 "unknown subcommand: $SUB (expected list, show, runs, or usage)" ;;
+  list|show|runs|usage|send|cancel|archive|unarchive|create) ;;
+  *) die 2 "unknown subcommand: $SUB (expected list, show, runs, usage, send, cancel, archive, unarchive, or create)" ;;
 esac
 
 require_tools

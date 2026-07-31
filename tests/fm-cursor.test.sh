@@ -36,6 +36,18 @@
 #       asserted through show as well as list, since each has its own renderer
 #   (q) FM_CURSOR_ENV_FILE takes precedence over $FM_HOME/.env
 #   (r) FM_CURSOR_TIMEOUT is validated before it reaches curl's config file
+#   (s) mutating verbs: send/archive refuse a busy agent and an indeterminate run
+#       state before issuing any request, a 409 race is a clean refusal, cancel
+#       targets only a genuinely active run, archive/unarchive are wired while
+#       delete deliberately is not, and none accepts a missing or wildcard id
+#   (t) a follow-up run NEVER carries mcpServers, because the API replaces the
+#       agent's create-time set and would strip its tools mid-conversation
+#   (u) create NAMES the environment and never enumerates repos, defaults the
+#       environment from config/cursor-environment, validates --model against the
+#       live catalog, and prints the new agent's url
+#   (v) the --no-runs footer never asserts an in-flight count
+#   (w) an API-supplied agent name carrying the record separator, a newline or a
+#       tab cannot split or truncate its table row
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -70,17 +82,32 @@ ARGV=("$0" "$@")
 out=
 url=
 cfg=
+method=GET
+data=
 while [ "$#" -gt 0 ]; do
   case $1 in
     --config) cfg=$2; shift 2 ;;
     -o) out=$2; shift 2 ;;
     -w) shift 2 ;;
+    -X) method=$2; shift 2 ;;
+    -H) shift 2 ;;
+    --data-binary) data=$2; shift 2 ;;
     -*) shift ;;
     *) url=$1; shift ;;
   esac
 done
 : >> "$FM_CURSOR_TEST_CALLS"
-printf '%s\n' "$url" >> "$FM_CURSOR_TEST_CALLS"
+printf '%s %s\n' "$method" "$url" >> "$FM_CURSOR_TEST_CALLS"
+# Record the request body so a test can assert what was and was not sent -
+# notably that a follow-up never carries mcpServers and a create never carries
+# repos.
+if [ -n "$data" ] && [ -n "${FM_CURSOR_TEST_BODIES:-}" ]; then
+  case $data in
+    @*) cat "${data#@}" >> "$FM_CURSOR_TEST_BODIES" 2>/dev/null || true ;;
+    *) printf '%s' "$data" >> "$FM_CURSOR_TEST_BODIES" ;;
+  esac
+  printf '\n' >> "$FM_CURSOR_TEST_BODIES"
+fi
 # Credential guarantees, asserted at the moment of use.
 if [ -n "${FM_CURSOR_TEST_KEY:-}" ]; then
   for a in "${ARGV[@]}"; do
@@ -97,8 +124,12 @@ if [ -n "$cfg" ]; then
   printf '%s\n' "$cfg" >> "$FM_CURSOR_TEST_CFGS"
 fi
 slug=$(printf '%s' "${url#*://}" | sed 's/[^A-Za-z0-9]/_/g')
-body="$FM_CURSOR_TEST_FIXTURES/$slug.json"
-code_file="$FM_CURSOR_TEST_FIXTURES/$slug.code"
+# A method-qualified fixture wins, so a POST and a GET on the same path can be
+# answered differently; an unqualified fixture still serves both.
+body="$FM_CURSOR_TEST_FIXTURES/${method}_$slug.json"
+code_file="$FM_CURSOR_TEST_FIXTURES/${method}_$slug.code"
+[ -f "$body" ] || body="$FM_CURSOR_TEST_FIXTURES/$slug.json"
+[ -f "$code_file" ] || code_file="$FM_CURSOR_TEST_FIXTURES/$slug.code"
 code=200
 [ ! -f "$code_file" ] || code=$(cat "$code_file")
 if [ -f "$body" ]; then
@@ -128,6 +159,20 @@ fixture_code() {  # <url-path> <http-code>
   local slug
   slug=$(printf '%s' "api.cursor.com$1" | sed 's/[^A-Za-z0-9]/_/g')
   printf '%s' "$2" > "$FIXTURES/$slug.code"
+}
+
+# Method-qualified variants, so a POST and a GET on the same path can be answered
+# differently. The fake curl prefers <METHOD>_<slug> over the bare slug.
+fixture_post() {  # <url-path> <json>
+  local slug
+  slug=$(printf '%s' "api.cursor.com$1" | sed 's/[^A-Za-z0-9]/_/g')
+  printf '%s' "$2" > "$FIXTURES/POST_$slug.json"
+}
+
+fixture_post_code() {  # <url-path> <http-code>
+  local slug
+  slug=$(printf '%s' "api.cursor.com$1" | sed 's/[^A-Za-z0-9]/_/g')
+  printf '%s' "$2" > "$FIXTURES/POST_$slug.code"
 }
 
 # run_cursor <args...>: run the helper with the fake curl and the fixture home,
@@ -659,5 +704,175 @@ expect_code 3 "$RC" "an out-of-range timeout is refused"
 run_cursor_env FM_CURSOR_TIMEOUT=5 -- list --no-runs
 expect_code 0 "$RC" "a plain numeric timeout is accepted"
 pass "FM_CURSOR_TIMEOUT is validated before it can inject into the key's config file"
+
+# --- (s) mutating verbs ------------------------------------------------------
+#
+# These act on a live fleet, so the refusals matter more than the happy paths.
+
+BODIES="$TMP_ROOT/bodies"
+export FM_CURSOR_TEST_BODIES="$BODIES"
+
+AGENT_IDLE=bc-aaaa1111
+AGENT_BUSY=bc-bbbb2222
+AGENT_NORUNS=bc-cccc3333
+
+fixture "/v1/agents/$AGENT_IDLE/runs?limit=1" \
+  '{"items":[{"id":"run-idle9","status":"FINISHED","createdAt":"2026-07-30T10:00:00.000Z","durationMs":1000,"git":{"branches":[]}}]}'
+fixture "/v1/agents/$AGENT_BUSY/runs?limit=1" \
+  '{"items":[{"id":"run-busy9","status":"RUNNING","createdAt":"2026-07-31T10:00:00.000Z","durationMs":null,"git":{"branches":[]}}]}'
+fixture "/v1/agents/$AGENT_NORUNS/runs?limit=1" '{"items":[]}'
+
+# --- refusal: never steer or archive an agent whose run is still going.
+run_cursor send "$AGENT_BUSY" please also update the tests
+expect_code 5 "$RC" "send refuses a busy agent"
+assert_contains "$OUT" "busy" "the refusal says the agent is busy"
+assert_contains "$OUT" "run-busy9" "the refusal names the run that is active"
+assert_no_grep "POST" "$CALLS" "a refused send must issue no POST at all"
+
+run_cursor archive "$AGENT_BUSY"
+expect_code 5 "$RC" "archive refuses a busy agent"
+assert_no_grep "POST" "$CALLS" "a refused archive must issue no POST"
+pass "send and archive refuse a busy agent before issuing any request"
+
+# --- refusal when the state cannot be determined: never act blind.
+fixture "/v1/agents/bc-dddd4444/runs?limit=1" '{"message":"Too Many Requests"}'
+fixture_code "/v1/agents/bc-dddd4444/runs?limit=1" 429
+run_cursor send bc-dddd4444 "do something"
+expect_code 5 "$RC" "send refuses when the run state is unknown"
+assert_contains "$OUT" "cannot tell" "the refusal says the state could not be determined"
+assert_no_grep "POST" "$CALLS" "an unknown-state send must issue no POST"
+pass "an indeterminate run state is a refusal, not an optimistic send"
+
+# --- happy path: the follow-up body carries the prompt and NEVER mcpServers.
+: > "$BODIES"
+fixture_post "/v1/agents/$AGENT_IDLE/runs" \
+  '{"id":"run-new1","status":"CREATING","agentId":"bc-aaaa1111"}'
+run_cursor send "$AGENT_IDLE" refactor the auth module
+expect_code 0 "$RC" "send succeeds on an idle agent"
+assert_grep "POST https://api.cursor.com/v1/agents/$AGENT_IDLE/runs" "$CALLS" \
+  "send posts to the agent's runs endpoint"
+assert_contains "$OUT" "run-new1" "send reports the new run id"
+jq -e '.prompt.text == "refactor the auth module"' "$BODIES" >/dev/null \
+  || fail "the follow-up body must carry the prompt text verbatim: $(cat "$BODIES")"
+jq -e 'has("mcpServers") | not' "$BODIES" >/dev/null \
+  || fail "a follow-up must NEVER send mcpServers - the API replaces the agent's set and strips its tools"
+pass "send posts the prompt and never sends mcpServers"
+
+# --- a 409 losing the race is a clean refusal, not a crash.
+fixture_post "/v1/agents/$AGENT_IDLE/runs" '{"message":"agent_busy"}'
+fixture_post_code "/v1/agents/$AGENT_IDLE/runs" 409
+run_cursor send "$AGENT_IDLE" another prompt
+expect_code 5 "$RC" "a 409 race exits 5 as a refusal"
+assert_contains "$OUT" "became busy" "the 409 refusal explains the race"
+assert_contains "$OUT" "Nothing was sent" "the 409 refusal says nothing was sent"
+pass "a 409 from a race is a clean refusal rather than a stack trace"
+
+# --- cancel targets the active run, and refuses when there is nothing to cancel.
+fixture_post "/v1/agents/$AGENT_BUSY/runs/run-busy9/cancel" '{"ok":true}'
+run_cursor cancel "$AGENT_BUSY"
+expect_code 0 "$RC" "cancel succeeds on a running agent"
+assert_grep "POST https://api.cursor.com/v1/agents/$AGENT_BUSY/runs/run-busy9/cancel" "$CALLS" \
+  "cancel posts to the ACTIVE run's cancel endpoint"
+run_cursor cancel "$AGENT_IDLE"
+expect_code 5 "$RC" "cancel refuses when the latest run is already terminal"
+assert_contains "$OUT" "nothing to cancel" "the refusal says there is nothing to cancel"
+run_cursor cancel "$AGENT_NORUNS"
+expect_code 5 "$RC" "cancel refuses an agent with no runs"
+pass "cancel acts only on a genuinely active run"
+
+# --- archive/unarchive are the reversible pair, and DELETE is not wired at all.
+fixture_post "/v1/agents/$AGENT_IDLE/archive" '{"ok":true}'
+fixture_post "/v1/agents/$AGENT_IDLE/unarchive" '{"ok":true}'
+run_cursor archive "$AGENT_IDLE"
+expect_code 0 "$RC" "archive succeeds on an idle agent"
+assert_grep "POST https://api.cursor.com/v1/agents/$AGENT_IDLE/archive" "$CALLS" "archive posts to /archive"
+assert_contains "$OUT" "reversible" "archive says it is reversible"
+run_cursor unarchive "$AGENT_IDLE"
+expect_code 0 "$RC" "unarchive succeeds"
+assert_grep "POST https://api.cursor.com/v1/agents/$AGENT_IDLE/unarchive" "$CALLS" "unarchive posts to /unarchive"
+run_cursor delete "$AGENT_IDLE"
+expect_code 2 "$RC" "there is deliberately no delete subcommand"
+assert_contains "$OUT" "unknown subcommand" "delete is not a recognised verb"
+pass "archive and unarchive are wired, delete deliberately is not"
+
+# --- every mutating verb demands an explicit id: no default, no wildcard.
+for verb in send cancel archive unarchive; do
+  run_cursor "$verb"
+  expect_code 2 "$RC" "$verb without an agent id exits 2"
+  run_cursor "$verb" '*'
+  expect_code 2 "$RC" "$verb refuses a wildcard agent id"
+done
+pass "no mutating verb accepts a missing or wildcard agent id"
+
+# --- (x) create names the environment and never enumerates repos -------------
+
+printf 'AgentScan E2E\n' > "$CONFIG_DIR/cursor-environment"
+fixture "/v1/models" '{"models":[{"id":"composer-2.5"},{"id":"claude-opus-5"}]}'
+fixture_post "/v1/agents" \
+  '{"agent":{"id":"bc-new55555","status":"ACTIVE","url":"https://cursor.com/agents/bc-new55555","env":{"type":"cloud","name":"AgentScan E2E"}},"run":{"id":"run-new55","status":"CREATING"}}'
+
+: > "$BODIES"
+run_cursor create --prompt "add a smoke test"
+expect_code 0 "$RC" "create succeeds using the configured default environment"
+assert_grep "POST https://api.cursor.com/v1/agents" "$CALLS" "create posts to /v1/agents"
+jq -e '.env.name == "AgentScan E2E" and .env.type == "cloud"' "$BODIES" >/dev/null \
+  || fail "create must NAME the environment: $(cat "$BODIES")"
+jq -e 'has("repos") | not' "$BODIES" >/dev/null \
+  || fail "create must NEVER enumerate repos - repos and a named env are mutually exclusive and the env carries the secrets"
+jq -e '.prompt.text == "add a smoke test"' "$BODIES" >/dev/null || fail "create must carry the prompt"
+assert_contains "$OUT" "https://cursor.com/agents/bc-new55555" "create prints the agent url"
+assert_contains "$OUT" "AgentScan E2E" "create names the environment it used"
+pass "create names the default environment, never enumerates repos, and prints the url"
+
+: > "$BODIES"
+run_cursor create --env "Other Env" --prompt hi --model composer-2.5
+expect_code 0 "$RC" "an explicit --env and a catalog model are accepted"
+jq -e '.env.name == "Other Env" and .model.id == "composer-2.5"' "$BODIES" >/dev/null \
+  || fail "create must honour an explicit --env and --model: $(cat "$BODIES")"
+
+run_cursor create --prompt hi --model not-a-real-model
+expect_code 2 "$RC" "a model outside the account catalog exits 2"
+assert_contains "$OUT" "not in this account's catalog" "the model error names the problem"
+assert_contains "$OUT" "composer-2.5" "the model error lists what is available"
+assert_no_grep "POST" "$CALLS" "an invalid model must be rejected before any create POST"
+
+run_cursor create --env "Other Env"
+expect_code 2 "$RC" "create without a prompt exits 2"
+rm -f "$CONFIG_DIR/cursor-environment"
+run_cursor create --prompt hi
+expect_code 2 "$RC" "create with no --env and no configured default exits 2"
+assert_contains "$OUT" "cursor-environment" "the error points at the config file"
+printf 'AgentScan E2E\n' > "$CONFIG_DIR/cursor-environment"
+pass "create validates the model against the live catalog and demands an environment"
+
+# --- (aa) the --no-runs footer must never imply anything about activity ------
+
+run_cursor list --no-runs
+expect_code 0 "$RC" "list --no-runs succeeds"
+assert_not_contains "$OUT" "with a run in flight" \
+  "--no-runs must not assert an in-flight count after resolving nothing"
+assert_contains "$OUT" "none of whose runs were resolved" "--no-runs says nothing was resolved"
+pass "--no-runs never lets an unresolved row read as idle"
+
+# --- (bb) an API-supplied name cannot break the table -----------------------
+#
+# The row record is separator-delimited, so a name carrying that separator, a
+# newline or a tab would split or truncate its row if it were not sanitised.
+SEP=$(printf '\037')
+TAB=$(printf '\t')
+fixture "/v1/agents?limit=20&includeArchived=false" "$(jq -nc \
+  --arg hostile "Break${SEP}the${TAB}row" \
+  '{items:[{id:"bc-9999hostile",name:$hostile,status:"ACTIVE",latestRunId:"run-h1",
+            createdAt:"2026-07-30T10:00:00.000Z",updatedAt:"2026-07-30T10:00:00.000Z",
+            url:"https://cursor.com/agents/bc-9999hostile",env:{type:"cloud"},
+            repos:[{url:"https://github.com/snyk/minired"}]}]}')"
+fixture "/v1/agents/bc-9999hostile/runs/run-h1" \
+  '{"id":"run-h1","status":"FINISHED","durationMs":1000,"git":{"branches":[]}}'
+run_cursor list
+expect_code 0 "$RC" "list survives an agent name containing the record separator"
+assert_contains "$OUT" "1 agent(s) shown" "the hostile name must not split the row into extra rows"
+assert_contains "$OUT" "FINISHED" "the hostile row still renders its run status"
+assert_contains "$OUT" "Break the row" "the separator and tab are collapsed to spaces"
+pass "an API-supplied name cannot split or truncate a table row"
 
 printf '\nall fm-cursor tests passed\n'

@@ -308,7 +308,7 @@ Skipped items, such as a destination checkout that does not yet gitignore the it
 
 ## Cursor Cloud agent view (.env)
 
-`bin/fm-cursor.sh` gives firstmate a read-only view of the operator's own Cursor Cloud agents.
+`bin/fm-cursor.sh` lets firstmate read, steer, and create the operator's own Cursor Cloud agents.
 It is inert unless the firstmate home's gitignored `.env` contains a non-empty `CURSOR_API_KEY`, and it reports that condition instead of failing with an authentication error.
 Generate a user API key from [Cursor Dashboard -> API Keys](https://cursor.com/dashboard/api); the Cloud Agents API also accepts a team service account key, which only a Cursor team admin can create.
 A user API key sees only that user's own agents, so this view is per-operator rather than fleet-wide.
@@ -318,7 +318,12 @@ Unlike X mode, an ambient `CURSOR_API_KEY` in the environment does not activate 
 `FM_CURSOR_ENV_FILE` can point the helper at another `.env`-style file, and that file takes precedence over `$FM_HOME/.env`.
 The helper never reads the macOS keychain or `cursor-agent`'s stored credentials: those are undocumented, are not supported Cursor API credentials, and grant no access beyond the documented user key.
 
-Every subcommand is a GET, so this surface cannot create, steer, cancel, archive, or delete an agent.
+The read subcommands are `list`, `show`, `runs`, and `usage`; the mutating ones are `send`, `cancel`, `archive`, `unarchive`, and `create`.
+Every mutating subcommand requires an explicit agent id, with no most-recent default and no wildcard, because steering the wrong agent is not undone by re-running a command.
+`DELETE /v1/agents/{id}` is deliberately never wired: it is permanent, `archive` covers cleanup, and `unarchive` makes it reversible.
+Because one run can be active per agent, `send`, `cancel`, and `archive` read the latest run status first and refuse with an explanation naming the run rather than firing a request the API would answer with `409 agent_busy`; a run that starts in between still yields a clean refusal, and an indeterminate run state is also a refusal rather than an optimistic write.
+A follow-up run never sends `mcpServers`, because the API documents follow-up definitions as replacing the agent's create-time set, which would silently strip its tools mid-conversation.
+`create` names the environment and never enumerates repositories, since the two are mutually exclusive in the API and the environment is what carries the predefined secrets and MCP configuration.
 It also creates no task records and registers no watcher check, which is what keeps a cloud agent - an agent with no window and no worktree - from being mistaken for a stalled local crewmate by session-start recovery.
 Cursor Cloud is deliberately neither a runtime backend nor a harness; `.agents/skills/firstmate-cursor-cloud/SKILL.md` owns that boundary and the operating procedure, and the script header owns its exact command syntax.
 

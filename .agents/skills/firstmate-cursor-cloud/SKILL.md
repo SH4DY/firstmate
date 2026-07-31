@@ -1,8 +1,8 @@
 ---
 name: firstmate-cursor-cloud
 description: >-
-  Agent-only playbook for reading the captain's own Cursor Cloud agents without pretending they are a selectable runtime backend or a harness.
-  Use before reporting on Cursor Cloud agent activity, before answering what a cloud agent is doing or concluded, and before responding to requests to make Cursor Cloud native to firstmate.
+  Agent-only playbook for reading, steering, and creating the captain's own Cursor Cloud agents without pretending they are a selectable runtime backend or a harness.
+  Use before reporting on Cursor Cloud agent activity, before answering what a cloud agent is doing or concluded, before sending a follow-up to or cancelling, archiving, or creating a cloud agent, and before responding to requests to make Cursor Cloud native to firstmate.
 user-invocable: false
 metadata:
   internal: true
@@ -13,7 +13,8 @@ metadata:
 ## Overview
 
 Use this playbook when the captain asks what his Cursor Cloud agents are doing, what one of them concluded, or what they have consumed.
-The current supported shape is a read-only view through `bin/fm-cursor.sh`, not a `cursor` value in `FM_BACKEND` and not an eighth harness.
+The supported shape is `bin/fm-cursor.sh`, not a `cursor` value in `FM_BACKEND` and not an eighth harness.
+It reads the fleet with `list`, `show`, `runs`, and `usage`, and changes it with `send`, `cancel`, `archive`, `unarchive`, and `create`.
 
 `bin/fm-cursor.sh --help` owns the exact subcommands, flags, environment variables, and exit codes.
 [`docs/configuration.md`](../../../docs/configuration.md) owns the `.env` activation contract.
@@ -78,10 +79,32 @@ Run status resolution prefers a `latestRunId` field that list items carry in pra
 If the fast path ever disappears the fallback keeps working, so treat a change there as a Cursor-side change rather than a firstmate defect.
 The fallback is always attempted when the fast path fails, and neither `list` nor `show` aborts when both fail: a stale run id says nothing about the agent, which the helper has usually just fetched successfully, so the run alone degrades to `unknown` with its reason.
 
+## Changing the fleet
+
+These verbs act on real agents that cost real quota, so treat them as you would any other outward-facing action.
+
+- `send <agent-id> <text>` queues a follow-up run. `cancel <agent-id>` stops the active one.
+- `archive <agent-id>` is the cleanup verb and `unarchive` reverses it.
+- `create [--env <name>] --prompt <text>` starts a new agent, defaulting the environment to `config/cursor-environment`.
+
+Three rules are built into the helper and worth understanding rather than rediscovering.
+
+Only one run can be active per agent, so `send`, `cancel`, and `archive` read the latest run status first and refuse rather than firing a request the API would reject with `409 agent_busy`.
+An indeterminate run state is also a refusal: the helper will not risk interrupting live work it cannot see.
+Report a refusal as the concrete situation - that agent is still working - rather than as a tool error.
+
+A follow-up never sends `mcpServers`, because the API documents follow-up definitions as *replacing* the agent's create-time set.
+Passing them would silently strip the agent's tools mid-conversation with no error, so if anyone proposes adding that field, the answer is no unless the operator is deliberately overriding the set for one run.
+
+`create` names the environment and never enumerates repositories.
+The two are mutually exclusive in the API, and the environment carries the predefined secrets and MCP configuration, so building an agent by listing an environment's repositories yields one that looks correct and cannot authenticate.
+
+Every mutating verb needs an explicit agent id. There is no most-recent default and no wildcard, because steering the wrong agent is not undone by re-running the command.
+
 ## What this surface cannot do
 
-- **It cannot steer.** There is no `send`, `cancel`, `create`, `archive`, or `delete` verb, by design for this increment.
-  When the captain wants to steer a cloud agent, hand him the agent's Cursor Web URL from `show` and say plainly that firstmate cannot send the follow-up itself yet.
+- **It cannot delete.** `DELETE /v1/agents/{id}` is deliberately never wired, because it is permanent.
+  `archive` is the cleanup verb and `unarchive` reverses it, so prefer archiving and say so rather than reaching for a destructive path that does not exist here.
 - **It cannot show a live run's progress.** The Cloud Agents API has no conversation or messages endpoint, so there is no cheap bounded read of an in-flight run.
   A terminal run's final text is available through the API; for anything mid-run, escalate the URL rather than guessing.
 - **It cannot report money.** `usage` returns token counts only, because the Cloud Agents API exposes no price or charge field.
