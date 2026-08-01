@@ -27,6 +27,10 @@
 #       archiving, fast-forwards the worktree, archives, and disarms the check
 #   (h) bare-metal refuses a divergence rather than forcing
 #   (i) the return path uses the WORKTREE's branch, never the API's reported one
+#   (j) a branch pushed WITHOUT -u has no tracking ref but is still published;
+#       preflight must accept it and must still catch an unpushed commit on it
+#   (k) a branch on no remote at all is still refused, with the same wording
+#   (l) resolving the remote ref never writes tracking config or adds a remote
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -151,7 +155,8 @@ OUT=
 run_cloudify() {
   : > "$CALLS"; : > "$BODIES"
   set +e
-  OUT=$(PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" LIVE_WINDOWS="firstmate:fm-t1" \
+  OUT=$(PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" \
+    LIVE_WINDOWS="firstmate:fm-t1 firstmate:fm-t2 firstmate:fm-t3" \
     FM_CURSOR_API_BASE="https://api.cursor.com" "$CLOUDIFY" "$@" 2>&1)
   RC=$?
   set -e
@@ -332,5 +337,71 @@ assert_contains "$OUT" "divergence" "the refusal names the divergence"
 assert_contains "$OUT" "real work" "the refusal says the cloud commits matter"
 assert_no_grep "archive" "$CALLS" "a refused return must not archive the agent"
 pass "bare-metal refuses a divergence rather than forcing over the cloud agent's commits"
+
+# --- (j) a branch pushed without -u is still published -----------------------
+#
+# `git push <remote> <branch>` publishes the branch and updates
+# refs/remotes/<remote>/<branch> while setting NO tracking configuration. Reading
+# only @{upstream} therefore refused branches that were demonstrably on their
+# remote - in the live fleet that included a branch carrying an open pull
+# request. These use their own fixtures so t1's mutated end state cannot mask the
+# result.
+
+REPO2="$TMP_ROOT/repo2"; WT2="$TMP_ROOT/wt-t2"; BARE2="$TMP_ROOT/origin2.git"
+fm_git_worktree "$REPO2" "$WT2" fm/t2
+fm_git_add_origin "$REPO2" "$BARE2"
+# Deliberately WITHOUT -u: this is the state the defect mishandled.
+git -C "$WT2" push --quiet origin fm/t2
+[ -z "$(git -C "$WT2" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)" ] \
+  || fail "fixture t2 must have no tracking ref, or it does not exercise the defect"
+git -C "$WT2" rev-parse --verify --quiet refs/remotes/origin/fm/t2 >/dev/null \
+  || fail "fixture t2 must still have a remote-tracking ref from the push"
+fm_write_meta "$HOME_DIR/state/t2.meta" \
+  "window=firstmate:fm-t2" "endpoint_task_id=t2" "worktree=$WT2" \
+  "project=$REPO2" "harness=claude" "kind=ship" "mode=direct-PR" "yolo=on"
+mkdir -p "$HOME_DIR/data/t2"
+printf '# Handoff\n\nt2 context.\n' > "$HOME_DIR/data/t2/handoff.md"
+
+run_cloudify t2 --dry-run
+expect_code 0 "$RC" "a branch pushed without -u must pass preflight"
+assert_contains "$OUT" "would cloudify t2" "the published branch is accepted"
+assert_not_contains "$OUT" "no upstream remote" "a pushed branch must not be called unpublished"
+pass "a branch published without -u is recognised as published"
+
+# The not-ahead check must use that same remote ref, not silently skip.
+git -C "$WT2" -c user.name=t -c user.email=t@e commit -qm "unpushed on t2" --allow-empty
+run_cloudify t2 --dry-run
+expect_code 4 "$RC" "an unpushed commit on an untracked branch is still refused"
+assert_contains "$OUT" "ahead of" "the ahead check runs against the resolved remote ref"
+assert_contains "$OUT" "origin/fm/t2" "the refusal names the ref it compared against"
+git -C "$WT2" push --quiet origin fm/t2
+pass "the not-ahead check compares against the resolved remote ref"
+
+# --- (k) a branch on no remote is still refused, unchanged -------------------
+
+REPO3="$TMP_ROOT/repo3"; WT3="$TMP_ROOT/wt-t3"
+fm_git_worktree "$REPO3" "$WT3" fm/t3
+fm_write_meta "$HOME_DIR/state/t3.meta" \
+  "window=firstmate:fm-t3" "endpoint_task_id=t3" "worktree=$WT3" \
+  "project=$REPO3" "harness=claude" "kind=ship" "mode=direct-PR" "yolo=on"
+mkdir -p "$HOME_DIR/data/t3"
+printf '# Handoff\n\nt3 context.\n' > "$HOME_DIR/data/t3/handoff.md"
+
+run_cloudify t3 --dry-run
+expect_code 4 "$RC" "a branch on no remote is refused"
+assert_contains "$OUT" "has no upstream remote, so the cloud agent cannot fetch it" \
+  "the genuine refusal keeps its original wording"
+pass "a branch that is truly on no remote is still refused, with the same wording"
+
+# --- (l) preflight never mutates the repository ------------------------------
+#
+# Resolving a remote ref must not be achieved by setting one.
+[ -z "$(git -C "$WT2" config --get branch.fm/t2.remote || true)" ] \
+  || fail "preflight must not write tracking config"
+[ -z "$(git -C "$WT2" config --get branch.fm/t2.merge || true)" ] \
+  || fail "preflight must not write tracking config"
+[ -z "$(git -C "$WT3" config --get branch.fm/t3.remote || true)" ] \
+  || fail "preflight must not add a remote to reach a verdict"
+pass "preflight resolves the remote ref read-only, setting no upstream"
 
 printf '\nall fm-cloudify tests passed\n'

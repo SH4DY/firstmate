@@ -159,8 +159,17 @@ bare_metal_one() {  # <id>
     printf 'REFUSED %s: git fetch failed in %s; the return handoff is saved, nothing was archived\n' "$id" "$wt"
     return 1
   fi
-  upstream=$(git -C "$wt" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
-  if [ -z "$upstream" ]; then
+  # Same resolution as preflight, and for the same reason: a branch pushed
+  # without -u has no tracking config but is still on its remote, and refusing
+  # that here would strand a cloudified task with no way home.
+  local rr_rc=0
+  upstream=$(fm_cloudify_remote_ref "$wt" "$branch") || rr_rc=$?
+  if [ "$rr_rc" -eq 2 ]; then
+    printf 'REFUSED %s: branch %s is on its remote but not fetched into %s, so there is nothing local to fast-forward onto\n' \
+      "$id" "$branch" "$wt"
+    return 1
+  fi
+  if [ "$rr_rc" -ne 0 ] || [ -z "$upstream" ]; then
     printf 'REFUSED %s: branch %s has no upstream to fast-forward from\n' "$id" "$branch"
     return 1
   fi

@@ -67,6 +67,55 @@ fm_cloudify_task_ids() {  # <state-dir>
   done
 }
 
+# fm_cloudify_remote_ref <worktree> <branch>
+#
+# The remote ref this branch should be compared against, printed on stdout.
+#
+# A configured upstream is preferred, but its ABSENCE does not mean the branch is
+# unpublished. `git push <remote> <branch>` without -u pushes the branch and
+# updates refs/remotes/<remote>/<branch> while setting no tracking config at all,
+# which is an extremely common state - and treating it as "no upstream" is a
+# false negative that refuses a branch which is demonstrably on its remote.
+#
+# Strictly read-only: this never sets an upstream, never writes git config, and
+# never fetches. Preflight must not change the operator's repository to make its
+# own check pass.
+#
+# Exit status:
+#   0  a locally-resolvable ref was found and printed
+#   2  the branch exists on a remote but has not been fetched here, so nothing
+#      local can be compared against it yet
+#   1  the branch is on no remote at all - the genuine refusal
+fm_cloudify_remote_ref() {  # <worktree> <branch>
+  local wt=$1 branch=$2 ref remote remotes
+  ref=$(git -C "$wt" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
+  if [ -n "$ref" ]; then
+    printf '%s' "$ref"
+    return 0
+  fi
+
+  # origin first, then any other remote, so the common case resolves predictably.
+  remotes=$(git -C "$wt" remote 2>/dev/null || true)
+  for remote in origin $remotes; do
+    [ -n "$remote" ] || continue
+    if git -C "$wt" rev-parse --verify --quiet "refs/remotes/$remote/$branch" >/dev/null 2>&1; then
+      printf '%s/%s' "$remote" "$branch"
+      return 0
+    fi
+  done
+
+  # Nothing fetched locally. Ask the remotes themselves before refusing, so a
+  # branch that is published but not mirrored here is reported as needing a
+  # fetch rather than as unpublished.
+  for remote in origin $remotes; do
+    [ -n "$remote" ] || continue
+    if git -C "$wt" ls-remote --exit-code --heads "$remote" "$branch" >/dev/null 2>&1; then
+      return 2
+    fi
+  done
+  return 1
+}
+
 # fm_cloudify_preflight <state-dir> <id>
 #
 # The six conditions from the design, in order, each refusing with the exact
@@ -121,8 +170,14 @@ fm_cloudify_preflight() {  # <state-dir> <id>
     return 1
   fi
 
-  upstream=$(git -C "$wt" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
-  if [ -z "$upstream" ]; then
+  local rr_rc=0
+  upstream=$(fm_cloudify_remote_ref "$wt" "$branch") || rr_rc=$?
+  if [ "$rr_rc" -eq 2 ]; then
+    printf 'task %s branch %s is on its remote but has not been fetched into %s; run git fetch there so the preflight can verify nothing is unpushed' \
+      "$id" "$branch" "$wt"
+    return 1
+  fi
+  if [ "$rr_rc" -ne 0 ] || [ -z "$upstream" ]; then
     printf 'task %s branch %s has no upstream remote, so the cloud agent cannot fetch it' "$id" "$branch"
     return 1
   fi
