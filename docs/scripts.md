@@ -100,3 +100,8 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-public-followup-lib.sh` | Shared relay-activation gate, O(1) presence checks, and private transport paths for promised public replies |
 | `fm-public-followup.sh`  | Reconcile typed terminal work results into a public commitment and deliver its final reply once |
 | `fm-public-followup-emit.sh` | Report one typed terminal work result into the home that owes the public reply    |
+| `fm-cursor.sh`           | Read, steer, and create this operator's own Cursor Cloud agents by environment        |
+| `fm-cloudify.sh`         | Move a task's execution from its local worker to a Cursor Cloud agent                |
+| `fm-bare-metal.sh`       | Bring a cloudified task's execution back to its local worker                         |
+| `fm-cloudify-lib.sh`     | Shared location/agent-link metadata and the cloudify preflight                       |
+| `fm-cloudify-arm-check.sh` | Arm the watcher poll for a cloudified task through the custom-check seam            |

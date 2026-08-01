@@ -306,6 +306,70 @@ The locked bootstrap inheritance pass uses the same per-home changed-set and rer
 That live discovery starts from `state/*.meta` records with `kind=secondmate`; `data/secondmates.md` only backfills `home=` for older or incomplete meta records.
 Skipped items, such as a destination checkout that does not yet gitignore the item, are visible warnings but not hard failures.
 
+## Cursor Cloud agent view (.env)
+
+`bin/fm-cursor.sh` lets firstmate read, steer, and create the operator's own Cursor Cloud agents.
+It is inert unless the firstmate home's gitignored `.env` contains a non-empty `CURSOR_API_KEY`, and it reports that condition instead of failing with an authentication error.
+Generate a user API key from [Cursor Dashboard -> API Keys](https://cursor.com/dashboard/api); the Cloud Agents API also accepts a team service account key, which only a Cursor team admin can create.
+A user API key sees only that user's own agents, so this view is per-operator rather than fleet-wide.
+
+The key is read from that `.env` file only.
+Unlike X mode, an ambient `CURSOR_API_KEY` in the environment does not activate this helper and does not override the file, because an inherited variable would silently change which Cursor account firstmate speaks for.
+`FM_CURSOR_ENV_FILE` can point the helper at another `.env`-style file, and that file takes precedence over `$FM_HOME/.env`.
+The helper never reads the macOS keychain or `cursor-agent`'s stored credentials: those are undocumented, are not supported Cursor API credentials, and grant no access beyond the documented user key.
+
+The read subcommands are `list`, `show`, `runs`, and `usage`; the mutating ones are `send`, `cancel`, `archive`, `unarchive`, and `create`.
+Every mutating subcommand requires an explicit agent id, with no most-recent default and no wildcard, because steering the wrong agent is not undone by re-running a command.
+`DELETE /v1/agents/{id}` is deliberately never wired: it is permanent, `archive` covers cleanup, and `unarchive` makes it reversible.
+Because one run can be active per agent, `send`, `cancel`, and `archive` read the latest run status first and refuse with an explanation naming the run rather than firing a request the API would answer with `409 agent_busy`; a run that starts in between still yields a clean refusal, and an indeterminate run state is also a refusal rather than an optimistic write.
+A follow-up run never sends `mcpServers`, because the API documents follow-up definitions as replacing the agent's create-time set, which would silently strip its tools mid-conversation.
+`create` names the environment and never enumerates repositories, since the two are mutually exclusive in the API and the environment is what carries the predefined secrets and MCP configuration.
+It also creates no task records and registers no watcher check, which is what keeps a cloud agent - an agent with no window and no worktree - from being mistaken for a stalled local crewmate by session-start recovery.
+Cursor Cloud is deliberately neither a runtime backend nor a harness; `.agents/skills/firstmate-cursor-cloud/SKILL.md` owns that boundary and the operating procedure, and the script header owns its exact command syntax.
+
+One behavior is worth stating here because it is the easiest thing to misread: an agent's `status` field is lifecycle only, with the enum `ACTIVE|ARCHIVED`, and Cursor documents execution status as living on runs instead.
+`ACTIVE` therefore means "not archived", never "currently running", so `bin/fm-cursor.sh list` resolves each agent's latest run and reports the run status enum as its primary column.
+`curl` and `jq` are required, the same pair X mode requires.
+
+A Cursor agent maps onto a firstmate task, and a Cursor *environment* maps onto a project.
+An environment is a named, multi-repo, secret-bearing context, and `POST /v1/agents` accepts either a named environment or a bare repository list, which the API documents as mutually exclusive.
+An agent therefore belongs to its environment rather than to any repository inside it, so a change spanning a front end and a back end is one agent in one environment instead of several tasks.
+`list` and `show` lead with the environment for that reason, and an agent created from a bare repository list has no environment name and displays as the ad-hoc case with none of a named environment's predefined secrets.
+
+### Moving a task between local and cloud (/cloudify and /bare-metal)
+
+`bin/fm-cloudify.sh` moves a task's execution from its local worker to a Cursor Cloud agent, and `bin/fm-bare-metal.sh` brings it back.
+Each script's header owns its exact flags.
+
+The task keeps its identity, its `state/<id>.meta`, its status file and its runtime window in both modes; only where the work executes moves.
+The worker in the pane becomes a waiter exactly as it already is while a no-mistakes run's separate agent process does the work, so a cloudified task is never windowless and needs no supervision exemption.
+Two meta fields carry the state: `location=local|cloud`, absent meaning local, and `cursor_agent=bc-...`, which is retained after returning so the agent that did the work stays discoverable.
+
+Cloudifying refuses unless the task exists, is local, has a live window, sits on a branch with an upstream, has nothing uncommitted, and has nothing unpushed.
+The last two conditions have no override: the cloud agent starts from what the remote has, so cloudifying uncommitted or unpushed work destroys it.
+It also refuses unless the worker has already written `data/<id>/handoff.md`, which is what carries the context git cannot - what was tried and rejected, what looks wrong but is deliberate, the environment facts, and the verification recipe.
+`--all` reports each refusal individually and still migrates the remaining eligible tasks.
+
+The cloud agent is created against the configured environment with `workOnCurrentBranch` and a checkout instruction for the task's branch, so the environment's secrets and MCP configuration are kept while the commits still land on that branch.
+Run transitions arrive as ordinary `check:` wakes through the existing custom-check seam registered by `bin/fm-check-register.sh`; there is no second watcher or daemon.
+
+Returning captures the cloud agent's final text to `data/<id>/handoff-return.md` before anything is archived, then fast-forwards the worktree and archives the agent.
+It refuses while a run is still active unless explicitly told to cancel, and refuses a divergence rather than forcing, because the cloud agent's commits are real work.
+The branch it fast-forwards is always the worktree's own; the Cloud Agents API reports `run.git.branches[].branch` as `main` even when the commit landed on a feature branch, so that field is never trusted.
+
+### Default Cursor environment (config/cursor-environment)
+
+`config/cursor-environment` optionally records this home's default environment name.
+It is local and gitignored, like every other `config/` item, and it is not part of secondmate inherited configuration, so each home names its own default.
+The first non-empty, non-comment line is used, with surrounding whitespace trimmed and a trailing newline tolerated, matching how `bin/fm-harness.sh` reads `config/secondmate-harness`.
+The name is used verbatim otherwise, because Cursor environment names contain spaces and are case-sensitive.
+An absent file, or one holding only blank and comment lines, means this home has no default.
+
+The default is the intended *target* for a future operation that needs an environment, not a view preference.
+It therefore never filters implicitly: `bin/fm-cursor.sh list` always shows every environment and marks the default with `*`, because silently hiding the agents outside the default would misrepresent the fleet.
+Pass `--env` to narrow to the default, or `--env <name>` for another environment.
+Cursor's list endpoint has no environment filter, so `--env` narrows the fetched page locally: `--limit` bounds the fetch rather than the matches, the footer reports both counts, and filtering runs before latest-run resolution so a narrow `--env` costs far fewer requests.
+
 ## X mode (.env)
 
 X mode lets a firstmate instance answer public `@myfirstmate` mentions and act on normal reversible mention requests through firstmate's normal lifecycle.
@@ -441,6 +505,10 @@ FM_CODEX_WATCH_CHECKPOINT=180   # seconds per foreground watcher checkpoint in C
 FM_CREW_STATE_NM_TIMEOUT=10   # seconds allowed per no-mistakes query inside fm-crew-state.sh
 FM_CREW_STATE_RUNS_LIMIT=200  # recent no-mistakes run rows scanned when axi status cannot be attributed to the current code
 FM_CREW_STATE_BIN=bin/fm-crew-state.sh   # test override for the current-state reader used by working/paused watcher triage
+CURSOR_API_KEY=         # Cursor Cloud read-only view opt-in; .env only, an ambient value is ignored
+FM_CURSOR_ENV_FILE=     # optional alternate .env file for bin/fm-cursor.sh
+FM_CURSOR_API_BASE=https://api.cursor.com   # Cursor Cloud Agents API base URL
+FM_CURSOR_TIMEOUT=30    # seconds allowed per Cursor Cloud Agents API request
 FMX_PAIRING_TOKEN=      # X mode pairing token; .env opt-in authorizes replies and eligible lifecycle actions
 FMX_RELAY_URL=https://myfirstmate.io   # optional X relay override, mainly for local relay development
 FMX_ENV_FILE=           # optional alternate .env file for direct X client invocations; bootstrap still checks $FM_HOME/.env
