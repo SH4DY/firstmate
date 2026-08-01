@@ -101,6 +101,35 @@ The two are mutually exclusive in the API, and the environment carries the prede
 
 Every mutating verb needs an explicit agent id. There is no most-recent default and no wildcard, because steering the wrong agent is not undone by re-running the command.
 
+## Moving a task between local and cloud
+
+`/cloudify` moves a task's execution to a Cursor Cloud agent; `/bare-metal` brings it back.
+`bin/fm-cloudify.sh --help` and `bin/fm-bare-metal.sh --help` own the exact flags.
+
+The task keeps its identity, its `state/<id>.meta`, its status file **and its window** in both modes.
+Only where the work executes moves, so the worker in the pane becomes a waiter exactly as it already is while a no-mistakes run's separate agent process does the work.
+Nothing becomes windowless, which is why session start, `bin/fm-crew-state.sh` and `stuck-crewmate-recovery` need no exemption for a cloudified task.
+`location=local|cloud` and `cursor_agent=` are the only new meta fields, and `cursor_agent` is retained after returning so the agent that did the work stays discoverable.
+
+**Your part is the judgment; the scripts own the mechanics.**
+Before running `/cloudify`, tell the worker to commit everything, push, and write its handoff to `data/<id>/handoff.md`, then wait for it.
+`bin/fm-cloudify.sh` refuses without that file, so the handoff cannot be skipped, but it cannot write the handoff for you.
+After `/cloudify` succeeds, tell the worker it is now a waiter: stop working, do not touch the branch, remain available.
+After `/bare-metal`, hand the worker `data/<id>/handoff-return.md` and tell it to resume.
+
+**The handoff is the point of the whole feature**, so do not let the worker write a diff summary.
+It must carry what git cannot: where the work actually stands, what was tried and *rejected and why*, landmines that look wrong but are deliberate, environment facts learned the hard way, the exact commands that verify the work, and any open question or captain hold.
+Without the rejected-approaches section the receiving agent walks the same dead ends, which is the expensive failure this is designed to prevent.
+
+**Preflight refuses rather than half-migrating**, naming the exact condition: the task must exist, be local, have a live window, sit on a branch with an upstream, and have nothing uncommitted and nothing unpushed.
+The last two are hard rule 3 territory and have no `--force`: cloudifying either destroys that work, because the cloud agent starts from what the remote has.
+When a refusal names uncommitted or unpushed work, the fix is to have the worker commit and push, never to override.
+
+`--all` reports each refusal individually and still migrates the rest, so relay which tasks were skipped and why rather than a single pass/fail.
+
+On the return, `/bare-metal` refuses while a cloud run is still active unless explicitly told to cancel, captures the agent's final text as the return handoff *before* archiving anything, fast-forwards the worktree, and refuses a divergence rather than forcing over the cloud agent's commits.
+A divergence means both sides moved and it needs a human; treat it as real work at risk, not a glitch.
+
 ## What this surface cannot do
 
 - **It cannot delete.** `DELETE /v1/agents/{id}` is deliberately never wired, because it is permanent.

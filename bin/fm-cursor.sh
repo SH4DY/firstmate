@@ -30,7 +30,7 @@
 #   fm-cursor.sh archive <agent-id> [--json]
 #   fm-cursor.sh unarchive <agent-id> [--json]
 #   fm-cursor.sh create [--env <name>] (--prompt <text> | --prompt-file <path>)
-#                       [--model <id>] [--json]
+#                       [--model <id>] [--work-on-current-branch] [--json]
 #   fm-cursor.sh -h | --help
 #
 # Read subcommands:
@@ -72,6 +72,11 @@
 #   --no-runs     list only: skip latest-run resolution. One API call instead of
 #                 1+N, at the cost of the only column that says what is actually
 #                 running.
+#   --work-on-current-branch
+#                 create only: commits land on the branch the agent checks out,
+#                 instead of on a generated `cursor/...` branch. Combine with a
+#                 checkout instruction in the prompt to put a cloud agent on an
+#                 existing branch while still naming an environment.
 #   --env [<name>]
 #                 list only: show only agents in that environment. A bare --env
 #                 means this home's default from config/cursor-environment, and
@@ -824,6 +829,7 @@ cmd_runs() {
       count: ((.items // []) | length),
       runs: [(.items // [])[] | {
         id, status, createdAt, updatedAt, durationMs,
+        result: (.result // null),
         branches: [(.git.branches // [])[] | {repoUrl, branch, prUrl}]
       }]
     }' "$BODY"
@@ -1040,10 +1046,11 @@ archive_verb() {  # <archive|unarchive> <args...>
 }
 
 cmd_create() {
-  local json=0 env_name='' prompt='' prompt_file='' model=''
+  local json=0 env_name='' prompt='' prompt_file='' model='' current_branch=0
   while [ "$#" -gt 0 ]; do
     case $1 in
       --json) json=1 ;;
+      --work-on-current-branch) current_branch=1 ;;
       --env)
         [ "$#" -ge 2 ] && [ -n "$2" ] || die 2 "--env needs an environment name"
         env_name=$2; shift ;;
@@ -1095,15 +1102,16 @@ cmd_create() {
   # predefined secrets and MCP configuration. Enumerating an environment's
   # repositories instead would produce an agent that looks right and cannot
   # authenticate.
-  if [ -n "$model" ]; then
-    jq -n --arg t "$prompt" --arg e "$env_name" --arg m "$model" \
-      '{prompt: {text: $t}, env: {type: "cloud", name: $e}, model: {id: $m}}' > "$REQ" \
-      || die 3 "could not build the request body"
-  else
-    jq -n --arg t "$prompt" --arg e "$env_name" \
-      '{prompt: {text: $t}, env: {type: "cloud", name: $e}}' > "$REQ" \
-      || die 3 "could not build the request body"
-  fi
+  # workOnCurrentBranch is accepted alongside a NAMED environment, verified
+  # against the live API on 2026-08-01: the commit lands on whatever branch the
+  # agent checks out rather than on a generated `cursor/...` branch, so an
+  # environment's secrets and branch control are not an either/or choice.
+  jq -n --arg t "$prompt" --arg e "$env_name" --arg m "$model" \
+    --argjson cur "$([ "$current_branch" -eq 1 ] && echo true || echo false)" '
+      {prompt: {text: $t}, env: {type: "cloud", name: $e}}
+      + (if $m == "" then {} else {model: {id: $m}} end)
+      + (if $cur then {workOnCurrentBranch: true} else {} end)' > "$REQ" \
+    || die 3 "could not build the request body"
 
   api_try_post "/v1/agents" "$REQ" || die 4 "$API_ERROR"
 

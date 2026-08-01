@@ -336,6 +336,27 @@ An environment is a named, multi-repo, secret-bearing context, and `POST /v1/age
 An agent therefore belongs to its environment rather than to any repository inside it, so a change spanning a front end and a back end is one agent in one environment instead of several tasks.
 `list` and `show` lead with the environment for that reason, and an agent created from a bare repository list has no environment name and displays as the ad-hoc case with none of a named environment's predefined secrets.
 
+### Moving a task between local and cloud (/cloudify and /bare-metal)
+
+`bin/fm-cloudify.sh` moves a task's execution from its local worker to a Cursor Cloud agent, and `bin/fm-bare-metal.sh` brings it back.
+Each script's header owns its exact flags.
+
+The task keeps its identity, its `state/<id>.meta`, its status file and its runtime window in both modes; only where the work executes moves.
+The worker in the pane becomes a waiter exactly as it already is while a no-mistakes run's separate agent process does the work, so a cloudified task is never windowless and needs no supervision exemption.
+Two meta fields carry the state: `location=local|cloud`, absent meaning local, and `cursor_agent=bc-...`, which is retained after returning so the agent that did the work stays discoverable.
+
+Cloudifying refuses unless the task exists, is local, has a live window, sits on a branch with an upstream, has nothing uncommitted, and has nothing unpushed.
+The last two conditions have no override: the cloud agent starts from what the remote has, so cloudifying uncommitted or unpushed work destroys it.
+It also refuses unless the worker has already written `data/<id>/handoff.md`, which is what carries the context git cannot - what was tried and rejected, what looks wrong but is deliberate, the environment facts, and the verification recipe.
+`--all` reports each refusal individually and still migrates the remaining eligible tasks.
+
+The cloud agent is created against the configured environment with `workOnCurrentBranch` and a checkout instruction for the task's branch, so the environment's secrets and MCP configuration are kept while the commits still land on that branch.
+Run transitions arrive as ordinary `check:` wakes through the existing custom-check seam registered by `bin/fm-check-register.sh`; there is no second watcher or daemon.
+
+Returning captures the cloud agent's final text to `data/<id>/handoff-return.md` before anything is archived, then fast-forwards the worktree and archives the agent.
+It refuses while a run is still active unless explicitly told to cancel, and refuses a divergence rather than forcing, because the cloud agent's commits are real work.
+The branch it fast-forwards is always the worktree's own; the Cloud Agents API reports `run.git.branches[].branch` as `main` even when the commit landed on a feature branch, so that field is never trusted.
+
 ### Default Cursor environment (config/cursor-environment)
 
 `config/cursor-environment` optionally records this home's default environment name.
