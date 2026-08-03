@@ -1472,12 +1472,15 @@ cmd_watch() {
     # A dropped or cut-off connection. Resume from the last event rather than
     # replaying, and only while there is budget and the retention window holds.
     now=$(date +%s)
-    if [ "$now" -ge "$deadline" ]; then
-      give_up='the watch timeout expired'
-      break
-    fi
+    # The attempt budget is checked FIRST, because when both limits have been
+    # reached it is the more precise cause: a watch with no reconnections left was
+    # never going to continue, whatever time remained.
     if [ "$tries" -ge "$attempts" ]; then
       give_up="the stream dropped and the $attempts reconnection attempt(s) allowed were used"
+      break
+    fi
+    if [ "$now" -ge "$deadline" ]; then
+      give_up='the watch timeout expired'
       break
     fi
     if [ -n "$STREAM_RETENTION" ] && [ "$((now - start))" -gt "$STREAM_RETENTION" ]; then

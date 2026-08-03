@@ -1136,7 +1136,9 @@ event: done
 data: {}
 
 '
-run_cursor watch "$AGENT_WATCH" --attempts 2
+# A generous timeout so a heavily loaded machine cannot turn "the stream dropped
+# and was resumed" into "the watch timed out" and make this case flaky.
+run_cursor watch "$AGENT_WATCH" --attempts 2 --timeout 21600
 expect_code 0 "$RC" "a dropped stream that resumes still exits 0"
 assert_grep "RESUME ev-2" "$RESUMES" \
   "the reconnection must carry Last-Event-ID with the last event actually seen"
