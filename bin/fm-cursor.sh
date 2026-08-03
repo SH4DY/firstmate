@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# fm-cursor.sh - read-only view of THIS operator's own Cursor Cloud agents.
+# fm-cursor.sh - read, watch, steer, and create THIS operator's own Cursor Cloud
+# agents.
 #
 # Cursor Cloud agents run on Cursor's infrastructure, not in a firstmate
 # worktree or terminal endpoint, so they are deliberately NOT a runtime backend
@@ -23,8 +24,10 @@
 # Usage:
 #   fm-cursor.sh list   [--json] [--all] [--limit <n>] [--no-runs] [--env [<name>]]
 #   fm-cursor.sh show   <agent-id> [--json]
-#   fm-cursor.sh runs   <agent-id> [--json] [--limit <n>]
+#   fm-cursor.sh runs   <agent-id> [--json] [--limit <n>] [--no-result]
 #   fm-cursor.sh usage  <agent-id> [--json]
+#   fm-cursor.sh watch  <agent-id> [--run <run-id>] [--timeout <s>]
+#                       [--attempts <n>] [--replay] [--json]
 #   fm-cursor.sh send   <agent-id> <prompt...> [--json]
 #   fm-cursor.sh cancel <agent-id> [--json]
 #   fm-cursor.sh archive <agent-id> [--json]
@@ -41,6 +44,10 @@
 #   runs   Run history for one agent: status, start, duration, and any PR URL.
 #   usage  Token usage for one agent: the totals and the run count. The per-run
 #          breakdown is in --json only.
+#   watch  Stream one run's events live, in the foreground, until it ends or the
+#          timeout expires. This is the only way to see what a cloud run is doing
+#          WHILE it runs: the Cloud Agents API has no conversation or messages
+#          endpoint, so without this the choice is Cursor Web or nothing.
 #
 # Mutating subcommands, which act on the operator's LIVE fleet:
 #   send      Queue a follow-up run on an existing agent.
@@ -65,13 +72,26 @@
 # Options:
 #   --json        Emit a stable JSON document instead of the human table.
 #                 Schemas: fm-cursor-list.v1, fm-cursor-show.v1,
-#                 fm-cursor-runs.v1, fm-cursor-usage.v1.
+#                 fm-cursor-runs.v1, fm-cursor-usage.v1. `watch` streams instead:
+#                 one fm-cursor-watch-event.v1 object per event as it arrives,
+#                 then one fm-cursor-watch.v1 summary object last.
 #   --all         list only: include ARCHIVED agents.
 #   --limit <n>   list: agents to fetch, 1-100, default 20.
 #                 runs: runs to fetch, 1-100, default 20.
 #   --no-runs     list only: skip latest-run resolution. One API call instead of
 #                 1+N, at the cost of the only column that says what is actually
 #                 running.
+#   --no-result   runs only: skip result hydration, so `result` carries whatever
+#                 the list endpoint gave (in practice: nothing).
+#   --run <id>    watch only: watch this run instead of the agent's latest.
+#   --timeout <s> watch only: total seconds to watch, 5-21600, default 900. Also
+#                 the hard bound on every connection, so nothing can outlive it.
+#   --attempts <n>
+#                 watch only: reconnections allowed after a dropped stream, 0-9,
+#                 default 3. Each one resumes from the last event seen.
+#   --replay      watch only: stream a run that has ALREADY ended. The stream
+#                 replays that run's whole history, which is a full transcript
+#                 and can be thousands of events, so it is opt-in.
 #   --work-on-current-branch
 #                 create only: commits land on the branch the agent checks out,
 #                 instead of on a generated `cursor/...` branch. Combine with a
@@ -121,7 +141,62 @@
 # subcommand - the agent list, one agent, its runs, its usage - because there a
 # non-200 means the operation itself failed and nothing is left to show.
 #
-# Activation: read-only, and inert until this home opts in by putting a non-empty
+# Why `runs --json` hydrates the result: the LIST endpoint
+# `/v1/agents/{id}/runs` omits `result` even for a FINISHED run, while
+# `/v1/agents/{id}/runs/{runId}` returns it populated - verified live on
+# 2026-08-01 against a finished run whose list item carried no result field at
+# all. A consumer reading the list item therefore sees `result: null` and cannot
+# tell "the agent said nothing" from "this endpoint does not carry it", which is
+# how bin/fm-bare-metal.sh would silently write an EMPTY return handoff and lose
+# the cloud agent's entire reasoning. So `runs --json` fetches the individual run
+# for each listed run that is TERMINAL and whose list item has no result, and
+# records where the answer came from in `resultSource`: `list-item` when the list
+# carried it, `run-detail` when it was hydrated, `pending` for a run still going
+# (no result exists yet), `absent` when the run itself reports none, `unavailable`
+# when the hydrating request failed - with the reason in `resultReason` - or
+# `skipped` under --no-result. Hydration is bounded and non-fatal: a run still
+# running costs no extra request, a failed hydration degrades that one run, and
+# the human table is unchanged because it never showed result text.
+#
+# Why `watch` is FOREGROUND-ONLY, and deliberately not a daemon: firstmate has
+# exactly one watcher and no per-task daemons, and an SSE connection is inherently
+# long-lived, which is exactly the shape that has wedged before. `watch` therefore
+# runs in the foreground, prints to the terminal, and is bounded twice over: an
+# overall --timeout deadline, and the same deadline handed to curl as --max-time
+# on every connection so no connection can outlive the command. It creates no task
+# record, arms no check, writes no state, and starts no background process, so
+# there is nothing here for supervision to adopt or for a wedge to happen in.
+#
+# STREAMING IS AN ACCELERATOR, NEVER THE AUTHORITY. bin/fm-cloudify-arm-check.sh
+# remains the only thing that guarantees firstmate learns a cloud run finished:
+# `watch` does not touch it, is not armed by it, and is not consulted by it. When
+# the stream and the poll disagree, the poll wins - which is why `watch` confirms
+# its own outcome against `GET /v1/agents/{id}/runs/{runId}` before reporting,
+# rather than trusting the last event it happened to see.
+#
+# Stream mechanics, all verified live on 2026-08-01:
+#   - The stream REPLAYS the requested run from its beginning, and is scoped to
+#     that one run; it never carries a different run's events.
+#   - `Last-Event-ID` resumption works: a reconnect carrying the last id seen
+#     continues immediately after that event rather than replaying from the start,
+#     so a dropped connection costs nothing but the reconnect.
+#   - The response carries `X-Cursor-Stream-Retention-Seconds` (86400 observed).
+#     Past that window the stream is gone and answers `410 stream_expired`, so
+#     `watch` reports the retention window rather than assuming a stream exists,
+#     declines to resume once that window has passed, and falls back to the run
+#     endpoint for terminal state on a 410.
+#   - `heartbeat` is liveness only and is NEVER rendered as content.
+#   - `interaction_update` is a delta channel that duplicates `assistant` and
+#     `thinking` (`text-delta`, `thinking-delta`) plus accounting (`token-delta`,
+#     step and tool-call lifecycle). It is counted, not printed, because printing
+#     it would double every word the agent said. --json still carries all of it.
+#
+# No stream failure can fail the command: a drop, a 410, a rate limit, an expired
+# window and a network outage all degrade to "no live view, the poll still works"
+# with the reason named, and `watch` still exits 0. Only a usage error, a missing
+# credential, or having no run to watch at all is an error.
+#
+# Activation: inert until this home opts in by putting a non-empty
 # CURSOR_API_KEY in its gitignored .env, mirroring how X mode gates on
 # FMX_PAIRING_TOKEN. The key is read from that file ONLY. This helper never
 # consults the macOS keychain, `cursor-agent`'s stored credentials, or an ambient
@@ -135,8 +210,9 @@
 # and never included in an error message; HTTP failures report the status code
 # and the API's own `message` field only.
 #
-# Every call is a GET. This helper has no verb that creates, steers, cancels,
-# archives, or deletes anything, so it cannot alter the operator's fleet.
+# The read verbs - list, show, runs, usage, watch - only ever issue GETs and
+# cannot alter the operator's fleet. `watch` is a read verb: attaching to a run's
+# stream observes it and never steers it.
 #
 # Files:
 #   $FM_HOME/.env                     CURSOR_API_KEY, the activation gate
@@ -151,10 +227,13 @@
 #   FM_CONFIG_OVERRIDE    read config/ from this directory instead
 #   FM_CURSOR_API_BASE    API base URL (default https://api.cursor.com)
 #   FM_CURSOR_TIMEOUT     per-request timeout in seconds, a whole number from 1
-#                         to 3600 (default 30)
+#                         to 3600 (default 30). It bounds the ordinary requests;
+#                         a `watch` stream is bounded by --timeout instead, since
+#                         a live stream is expected to stay open.
 #
 # Exit status:
-#   0  success
+#   0  success, including every degraded `watch` outcome: a dropped stream, an
+#      expired one, a rate limit, or a timeout is reported, never an error
 #   2  usage error
 #   3  not configured (no CURSOR_API_KEY), misconfigured (a key or timeout this
 #      helper refuses to hand to curl), or a required tool is missing
@@ -202,10 +281,14 @@ default_environment() {
 CFG=
 BODY=
 REQ=
+SCFG=
+STREAM_HDR=
 cleanup() {
   [ -z "$CFG" ] || rm -f -- "$CFG"
   [ -z "$BODY" ] || rm -f -- "$BODY"
   [ -z "$REQ" ] || rm -f -- "$REQ"
+  [ -z "$SCFG" ] || rm -f -- "$SCFG"
+  [ -z "$STREAM_HDR" ] || rm -f -- "$STREAM_HDR"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -232,9 +315,12 @@ require_tools() {
   done
 }
 
-# Arm curl with the operator's key in a mode-0600 config file. The key never
-# reaches argv, so it is not visible in `ps`.
-arm_auth() {
+# The validated key, held only in this process and in the mode-0600 config files
+# written from it. Loaded through a function that assigns rather than one that
+# prints, because `die` inside a command substitution would exit the SUBSHELL and
+# leave the caller running with an empty key.
+API_KEY=
+load_api_key() {
   local env_file token
   env_file=${FM_CURSOR_ENV_FILE:-$FM_HOME/.env}
   token=$(fmx_env_get CURSOR_API_KEY "$env_file")
@@ -247,21 +333,49 @@ arm_auth() {
     *[!A-Za-z0-9._~+/=-]*)
       die 3 "the CURSOR_API_KEY in $env_file contains unexpected characters; re-copy it from https://cursor.com/dashboard/api" ;;
   esac
-  # The same config file carries the bearer header, and curl config syntax is one
-  # directive per line, so an unvalidated timeout is an injection point: a value
-  # holding a newline would append arbitrary directives (proxy, url, output) next
-  # to the key. Digits only, and a range, so a typo also fails legibly instead of
-  # degrading into an opaque "could not reach" error.
+  API_KEY=$token
+}
+
+# Write one mode-0600 curl config carrying the bearer header and a max-time.
+# Curl config syntax is one directive per line, so an unvalidated timeout is an
+# injection point: a value holding a newline would append arbitrary directives
+# (proxy, url, output) next to the key. Every caller therefore passes a
+# valid_timeout-checked number.
+write_curl_config() {  # <path> <max-time>
+  printf 'header = "Authorization: Bearer %s"\nsilent\nshow-error\nmax-time = %s\n' \
+    "$API_KEY" "$2" > "$1" || die 3 "could not write the API key file"
+}
+
+# Arm curl with the operator's key in a mode-0600 config file. The key never
+# reaches argv, so it is not visible in `ps`.
+arm_auth() {
+  load_api_key
+  # Digits only, and a range, so a typo fails legibly instead of degrading into
+  # an opaque "could not reach" error.
   valid_timeout "$TIMEOUT" \
     || die 3 "FM_CURSOR_TIMEOUT must be a whole number of seconds from 1 to 3600"
   umask 077
   CFG=$(mktemp "${TMPDIR:-/tmp}/.fm-cursor-auth.XXXXXX") \
     || die 3 "could not create a private file for the API key"
   chmod 600 "$CFG" || die 3 "could not restrict permissions on the API key file"
-  printf 'header = "Authorization: Bearer %s"\nsilent\nshow-error\nmax-time = %s\n' \
-    "$token" "$TIMEOUT" > "$CFG" || die 3 "could not write the API key file"
+  write_curl_config "$CFG" "$TIMEOUT"
   BODY=$(mktemp "${TMPDIR:-/tmp}/.fm-cursor-body.XXXXXX") \
     || die 3 "could not create a response file"
+}
+
+# A second config for `watch`, identical except that its max-time is the whole
+# watch deadline. A stream is expected to stay open, so the ordinary per-request
+# timeout would cut it off; a SEPARATE file rather than a command-line override
+# keeps the ordinary requests this command still makes - resolving the run, and
+# confirming the outcome afterwards - on their normal short timeout.
+arm_stream_config() {  # <max-time>
+  umask 077
+  SCFG=$(mktemp "${TMPDIR:-/tmp}/.fm-cursor-stream.XXXXXX") \
+    || die 3 "could not create a private file for the API key"
+  chmod 600 "$SCFG" || die 3 "could not restrict permissions on the API key file"
+  write_curl_config "$SCFG" "$1"
+  STREAM_HDR=$(mktemp "${TMPDIR:-/tmp}/.fm-cursor-hdr.XXXXXX") \
+    || die 3 "could not create a header file"
 }
 
 # GET <path>; leaves the response body in $BODY. Returns 0 only on HTTP 200, and
@@ -796,10 +910,11 @@ cmd_show() {
 }
 
 cmd_runs() {
-  local json=0 agent='' limit=20
+  local json=0 agent='' limit=20 hydrate=1
   while [ "$#" -gt 0 ]; do
     case $1 in
       --json) json=1 ;;
+      --no-result) hydrate=0 ;;
       --limit)
         [ "$#" -ge 2 ] || die 2 "--limit needs a value"
         valid_limit "$2" || die 2 "--limit must be a whole number from 1 to 100"
@@ -823,16 +938,67 @@ cmd_runs() {
 
   api_get "/v1/agents/$agent/runs?limit=$limit"
   if [ "$json" -eq 1 ]; then
-    jq --arg a "$agent" '{
-      schema: "fm-cursor-runs.v1",
-      agentId: $a,
-      count: ((.items // []) | length),
-      runs: [(.items // [])[] | {
+    # The list endpoint omits `result`, so every consumer that needs the agent's
+    # final text - bin/fm-bare-metal.sh's return handoff above all - would read
+    # null and cannot tell "said nothing" from "not carried here". Classify first
+    # in one pass, then hydrate only the runs that genuinely need a request.
+    local runs
+    runs=$(jq -c --argjson hydrate "$hydrate" '[(.items // [])[] | {
         id, status, createdAt, updatedAt, durationMs,
         result: (.result // null),
+        resultSource: (
+          if (.result // null) != null then "list-item"
+          elif $hydrate == 0 then "skipped"
+          elif (.status // "") == "CREATING" or (.status // "") == "RUNNING" then "pending"
+          else "needs-hydration" end),
+        resultReason: null,
         branches: [(.git.branches // [])[] | {repoUrl, branch, prUrl}]
-      }]
-    }' "$BODY"
+      }]' "$BODY")
+    local idx run_id
+    while IFS=$(printf '\t') read -r idx run_id; do
+      [ -n "$idx" ] || continue
+      if ! valid_agent_id "$run_id"; then
+        runs=$(printf '%s' "$runs" | jq -c --argjson k "$idx" \
+          '.[$k] |= (.resultSource = "unavailable" | .resultReason = "the run id is not a usable id")')
+        continue
+      fi
+      if api_try_get "/v1/agents/$agent/runs/$run_id"; then
+        local merged=''
+        # A body that is not the expected JSON must degrade this one run rather
+        # than abort the history, so the merge is attempted, not assumed.
+        merged=$(printf '%s' "$runs" | jq -c --argjson k "$idx" --slurpfile d "$BODY" '
+          ($d[0].result // null) as $r
+          | .[$k] |= (.result = $r
+              | .resultSource = (if $r == null then "absent" else "run-detail" end))' 2>/dev/null) || merged=''
+        if [ -n "$merged" ]; then
+          runs=$merged
+        else
+          runs=$(printf '%s' "$runs" | jq -c --argjson k "$idx" \
+            '.[$k] |= (.resultSource = "unavailable" | .resultReason = "the run detail response was not readable JSON")')
+        fi
+      else
+        # Non-fatal, exactly like run-status resolution: one run degrades and
+        # carries its reason, and the rest of the history is unaffected.
+        runs=$(printf '%s' "$runs" | jq -c --argjson k "$idx" --arg why "$API_ERROR" \
+          '.[$k] |= (.resultSource = "unavailable" | .resultReason = $why)')
+      fi
+    done <<EOF
+$(printf '%s' "$runs" | jq -r 'to_entries[]
+  | select(.value.resultSource == "needs-hydration")
+  | [(.key | tostring), .value.id] | @tsv')
+EOF
+    # `needs-hydration` is an internal marker and must never reach a consumer.
+    # Every entry carrying it was visited above, so this is a belt on top of the
+    # braces: if one ever survived, it means the request never happened.
+    printf '%s' "$runs" | jq --arg a "$agent" '{
+      schema: "fm-cursor-runs.v1",
+      agentId: $a,
+      count: length,
+      runs: map(if .resultSource == "needs-hydration"
+                then .resultSource = "unavailable"
+                   | .resultReason = "the run detail request was never made"
+                else . end)
+    }'
     return 0
   fi
 
@@ -901,6 +1067,482 @@ cmd_usage() {
   done
   echo
   echo 'Cursor reports tokens only; this API exposes no cost figure, so firstmate cannot report spend here.'
+}
+
+# --- watch: one run's event stream, in the foreground ------------------------
+#
+# The header owns the rationale. The invariants this code has to keep are:
+# nothing here outlives the command, nothing here is authoritative over the
+# watcher poll, and nothing here can turn a stream problem into a failure.
+
+WATCH_JSON=0
+WATCH_AGENT=
+WATCH_RUN=
+WATCH_SEQ=0
+LAST_EVENT_ID=
+STREAM_TERMINAL=0
+STREAM_HTTP=
+STREAM_RETENTION=
+STREAM_EVENTS=0
+STREAM_HEARTBEATS=0
+STREAM_TOKENS=0
+STREAM_TOOLS=0
+LAST_TOOL=
+AT_COL0=1
+CHANNEL=
+
+valid_attempts() {  # <n>
+  case $1 in
+    '' | *[!0-9]* | ??*) return 1 ;;
+    *) [ "$1" -ge 0 ] && [ "$1" -le 9 ] ;;
+  esac
+}
+
+valid_watch_timeout() {  # <seconds>
+  case $1 in
+    '' | *[!0-9]* | ??????*) return 1 ;;
+    *) [ "$1" -ge 5 ] && [ "$1" -le 21600 ] ;;
+  esac
+}
+
+# Escape one shell string into JSON string CONTENT, without forking. --json emits
+# one object per event and a busy run emits thousands, so a jq per event would
+# turn a live view into a slideshow. The remaining C0 controls are dropped rather
+# than passed through, because a raw control byte inside a JSON string is invalid
+# JSON and this text comes from the API, not from us.
+json_escape() {  # <text>
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  s=${s//[$'\001'-$'\010'$'\013'$'\014'$'\016'-$'\037'$'\177']/}
+  printf '%s' "$s"
+}
+
+# One event as one line of JSON. `data` is passed through as JSON when it looks
+# like a JSON object or array, which is what every documented event payload is,
+# and is emitted as a string otherwise so an unexpected payload still produces a
+# readable line instead of a broken one.
+emit_json_event() {  # <event> <event-id> <data>
+  local data=$3
+  WATCH_SEQ=$((WATCH_SEQ + 1))
+  printf '{"schema":"fm-cursor-watch-event.v1","agentId":"%s","runId":"%s","seq":%s,"eventId":"%s","event":"%s","data":' \
+    "$(json_escape "$WATCH_AGENT")" "$(json_escape "$WATCH_RUN")" "$WATCH_SEQ" \
+    "$(json_escape "$2")" "$(json_escape "$1")"
+  case $data in
+    '{'*|'['*) printf '%s' "${data//$'\n'/ }" ;;
+    '') printf 'null' ;;
+    *) printf '"%s"' "$(json_escape "$data")" ;;
+  esac
+  printf '}\n'
+}
+
+# The value of one SSE field line: everything after the colon, with at most one
+# leading space removed, per the event-stream format.
+sse_value() {  # <line>
+  local v=${1#*:}
+  printf '%s' "${v# }"
+}
+
+# Human rendering keeps a cursor position, because the text channels stream
+# deltas without newlines and every other line has to start at column 0.
+begin_line() {
+  [ "$AT_COL0" -eq 1 ] || printf '\n'
+  AT_COL0=1
+  CHANNEL=
+}
+
+text_out() {  # <channel> <text>
+  if [ "$1" != "$CHANNEL" ]; then
+    begin_line
+    printf '[%s] ' "$1"
+    CHANNEL=$1
+  fi
+  printf '%s' "$2"
+  case $2 in
+    *$'\n') AT_COL0=1 ;;
+    *) AT_COL0=0 ;;
+  esac
+}
+
+# One string field out of an event payload, tolerating a payload that is not an
+# object at all. Never fatal: an odd event must not end the watch.
+#
+# The value lands in FIELD_VALUE rather than on stdout because a text delta can be
+# nothing but newlines - the blank line between an agent's paragraphs arrives as
+# its own event - and a command substitution strips trailing newlines, which
+# silently ran those paragraphs together. A sentinel protects the value inside the
+# one substitution that is unavoidable, and is removed before use.
+FIELD_VALUE=
+event_field() {  # <data> <field>
+  local v
+  FIELD_VALUE=
+  v=$(printf '%s' "$1" | jq -r --arg f "$2" \
+    'if type == "object" and (.[$f] | type) == "string" then (.[$f] + "\u0003") else empty end' 2>/dev/null) || v=
+  case $v in
+    *$'\003') FIELD_VALUE=${v%$'\003'} ;;
+  esac
+}
+
+render_tool_call() {  # <data>
+  local line
+  line=$(printf '%s' "$1" | jq -r 'if type == "object"
+      then ((.name // "?") + " " + (.status // "?")) else "?" end' 2>/dev/null) || line='?'
+  line=${line//$'\n'/ }
+  # tool_call repeats as one call changes state, so print transitions only.
+  [ "$line" != "$LAST_TOOL" ] || return 0
+  LAST_TOOL=$line
+  STREAM_TOOLS=$((STREAM_TOOLS + 1))
+  begin_line
+  printf '[tool] %s\n' "$line"
+}
+
+dispatch_event() {  # <event> <data> <event-id>
+  local ev=$1 data=$2 eid=$3 txt
+  # A blank line with nothing accumulated is a keep-alive boundary, not an event.
+  [ -n "$ev" ] || [ -n "$data" ] || return 0
+  [ -n "$ev" ] || ev=message
+  [ -z "$eid" ] || LAST_EVENT_ID=$eid
+  STREAM_EVENTS=$((STREAM_EVENTS + 1))
+
+  case $ev in
+    heartbeat)
+      # Liveness only, in both modes. A heartbeat is not content and is never
+      # rendered as if the agent had said something.
+      STREAM_HEARTBEATS=$((STREAM_HEARTBEATS + 1)) ;;
+    interaction_update)
+      # The delta channel that duplicates assistant and thinking, plus token and
+      # lifecycle accounting. Counted here with a bash match rather than a jq
+      # call, because it is the highest-volume event by far.
+      if [[ $data =~ \"tokens\"[[:space:]]*:[[:space:]]*([0-9]+) ]]; then
+        STREAM_TOKENS=$((STREAM_TOKENS + BASH_REMATCH[1]))
+      fi ;;
+    done|error) STREAM_TERMINAL=1 ;;
+  esac
+
+  if [ "$WATCH_JSON" -eq 1 ]; then
+    emit_json_event "$ev" "$eid" "$data"
+    return 0
+  fi
+
+  case $ev in
+    heartbeat|interaction_update) ;;
+    assistant)
+      event_field "$data" text
+      [ -z "$FIELD_VALUE" ] || text_out assistant "$FIELD_VALUE" ;;
+    thinking)
+      event_field "$data" text
+      [ -z "$FIELD_VALUE" ] || text_out thinking "$FIELD_VALUE" ;;
+    tool_call) render_tool_call "$data" ;;
+    status)
+      event_field "$data" status
+      begin_line
+      printf '[status] %s\n' "$FIELD_VALUE" ;;
+    result)
+      event_field "$data" status
+      begin_line
+      printf '[result] %s\n' "$FIELD_VALUE"
+      event_field "$data" text
+      [ -z "$FIELD_VALUE" ] || printf '%s\n' "$FIELD_VALUE" ;;
+    error)
+      begin_line
+      event_field "$data" message
+      txt=$FIELD_VALUE
+      if [ -z "$txt" ]; then
+        event_field "$data" error
+        txt=$FIELD_VALUE
+      fi
+      printf '[error] %s\n' "${txt:-the stream reported an error with no message}" ;;
+    done)
+      begin_line
+      printf '[done] the stream reported this run complete\n' ;;
+    *)
+      begin_line
+      printf '[%s] %s\n' "$ev" "${data//$'\n'/ }" ;;
+  esac
+}
+
+# Status line and retention window out of the response headers. HTTP/2 lowercases
+# header names, so the retention header is matched case-insensitively.
+read_stream_headers() {
+  local line lower v
+  STREAM_HTTP=
+  [ -s "$STREAM_HDR" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    case $line in
+      HTTP/*)
+        v=${line#* }
+        STREAM_HTTP=${v%% *}
+        continue ;;
+    esac
+    lower=$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')
+    case $lower in
+      x-cursor-stream-retention-seconds:*)
+        v=${lower#*:}
+        v=${v## }
+        v=${v%% }
+        case $v in
+          '' | *[!0-9]*) ;;
+          *) STREAM_RETENTION=$v ;;
+        esac ;;
+    esac
+  done < "$STREAM_HDR"
+}
+
+# One connection. Reads until the stream ends, the run reports itself finished, or
+# curl's own --max-time cuts it off - so this function cannot outlive its budget
+# even if the far end never speaks again.
+stream_attempt() {  # <max-time>
+  local max=$1 line ev='' data='' eid='' chunk hdrs=()
+  : > "$STREAM_HDR"
+  # The event id comes from the API and goes back out in a request header, so a
+  # value carrying CR or LF would be header injection into our own request.
+  # Anything outside the observed shape is dropped rather than sanitized.
+  if [ -n "$LAST_EVENT_ID" ]; then
+    case $LAST_EVENT_ID in
+      *[!A-Za-z0-9._:-]*) LAST_EVENT_ID= ;;
+      *) hdrs=(-H "Last-Event-ID: $LAST_EVENT_ID") ;;
+    esac
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    case $line in
+      '')
+        dispatch_event "$ev" "$data" "$eid"
+        ev=''; data=''; eid=''
+        [ "$STREAM_TERMINAL" -eq 0 ] || break ;;
+      'id:'*) eid=$(sse_value "$line") ;;
+      'event:'*) ev=$(sse_value "$line") ;;
+      'data:'*)
+        chunk=$(sse_value "$line")
+        data=${data:+$data$'\n'}$chunk ;;
+      ':'*) ;;
+      # Anything else is an unknown SSE field or a response that is not an event
+      # stream at all - a JSON error body, for instance. Ignored on purpose: the
+      # status line in the headers is what says what happened.
+      *) ;;
+    esac
+  done < <(curl --config "$SCFG" --no-buffer --max-time "$max" \
+      -D "$STREAM_HDR" -H 'Accept: text/event-stream' \
+      "${hdrs[@]+${hdrs[@]}}" \
+      "$API_BASE/v1/agents/$WATCH_AGENT/runs/$WATCH_RUN/stream" 2>/dev/null)
+  read_stream_headers
+}
+
+# The authoritative outcome, taken from the run endpoint rather than from the last
+# event seen. This is the same source the watcher poll reads, which is what makes
+# "the poll wins" true here instead of merely intended.
+confirm_run_status() {  # -> prints "<status>\t<reason>"
+  if api_try_get "/v1/agents/$WATCH_AGENT/runs/$WATCH_RUN"; then
+    printf '%s\t' "$(jq -r '.status // "unknown"' "$BODY")"
+  else
+    printf 'unknown\t%s' "$API_ERROR"
+  fi
+}
+
+cmd_watch() {
+  local agent='' run='' timeout=900 attempts=3 replay=0 status='' reason=''
+  while [ "$#" -gt 0 ]; do
+    case $1 in
+      --json) WATCH_JSON=1 ;;
+      --replay) replay=1 ;;
+      --run)
+        [ "$#" -ge 2 ] && [ -n "$2" ] || die 2 "--run needs a run id"
+        run=$2; shift ;;
+      --run=*) run=${1#--run=}; [ -n "$run" ] || die 2 "--run= needs a run id" ;;
+      --timeout)
+        [ "$#" -ge 2 ] || die 2 "--timeout needs a value"
+        valid_watch_timeout "$2" || die 2 "--timeout must be a whole number of seconds from 5 to 21600"
+        timeout=$2; shift ;;
+      --timeout=*)
+        valid_watch_timeout "${1#--timeout=}" || die 2 "--timeout must be a whole number of seconds from 5 to 21600"
+        timeout=${1#--timeout=} ;;
+      --attempts)
+        [ "$#" -ge 2 ] || die 2 "--attempts needs a value"
+        valid_attempts "$2" || die 2 "--attempts must be a whole number from 0 to 9"
+        attempts=$2; shift ;;
+      --attempts=*)
+        valid_attempts "${1#--attempts=}" || die 2 "--attempts must be a whole number from 0 to 9"
+        attempts=${1#--attempts=} ;;
+      -*) die 2 "unknown option for watch: $1" ;;
+      *)
+        [ -z "$agent" ] || die 2 "watch takes exactly one agent id"
+        agent=$1 ;;
+    esac
+    shift
+  done
+  [ -n "$agent" ] || die 2 "watch needs an agent id (see: fm-cursor.sh list)"
+  valid_agent_id "$agent" || die 2 "not a valid agent id: $agent"
+  [ -z "$run" ] || valid_agent_id "$run" || die 2 "not a valid run id: $run"
+
+  # Which run, and what state is it in. Refusing here rather than streaming blind
+  # keeps a "watch" that could only ever hang from looking like a working one.
+  if [ -n "$run" ]; then
+    api_get "/v1/agents/$agent/runs/$run"
+    status=$(jq -r '.status // "unknown"' "$BODY")
+  else
+    read_run_status_record "$(latest_run_status "$agent" "")"
+    case $RUN_STATUS in
+      none) die 5 "agent $agent has no runs to watch yet." ;;
+      unknown) die 5 "cannot tell which run to watch on agent $agent: $RUN_REASON. Refusing to attach blind." ;;
+    esac
+    run=$RUN_ID
+    status=$RUN_STATUS
+  fi
+  WATCH_AGENT=$agent
+  WATCH_RUN=$run
+
+  # A terminal run's stream is a full transcript replay, which is useful but is
+  # not what "watch" means, so it is opt-in. The cheap answer - the final state
+  # and the agent's own final text - is what an operator asking about a finished
+  # run actually wants.
+  case $status in
+    FINISHED|ERROR|CANCELLED|EXPIRED)
+      if [ "$replay" -eq 0 ]; then
+        local final_text=''
+        if api_try_get "/v1/agents/$agent/runs/$run"; then
+          final_text=$(jq -r '.result // empty' "$BODY")
+        fi
+        if [ "$WATCH_JSON" -eq 1 ]; then
+          jq -nc --arg a "$agent" --arg r "$run" --arg s "$status" --arg t "$final_text" '{
+            schema: "fm-cursor-watch.v1", agentId: $a, runId: $r,
+            streamed: false, terminal: true, runStatus: $s,
+            runStatusSource: "run-detail",
+            reason: "the run had already ended; pass --replay to stream its history",
+            result: (if $t == "" then null else $t end)
+          }'
+          return 0
+        fi
+        printf 'Run %s on agent %s has already ended: %s.\n' "$run" "$agent" "$status"
+        if [ -n "$final_text" ]; then
+          printf '\nThe agent'"'"'s final text:\n\n%s\n' "$final_text"
+        else
+          printf 'The agent reported no final text for this run.\n'
+        fi
+        printf '\nNothing is streaming, because there is nothing left to watch. Pass --replay to stream this run'"'"'s full history from the beginning.\n'
+        return 0
+      fi ;;
+  esac
+
+  arm_stream_config "$timeout"
+
+  local start now deadline remaining tries=0 give_up='' delay=1
+  start=$(date +%s)
+  deadline=$((start + timeout))
+
+  if [ "$WATCH_JSON" -eq 0 ]; then
+    printf 'Watching run %s on agent %s (currently %s), up to %ss.\n' \
+      "$run" "$agent" "$status" "$timeout"
+    printf 'This is a live view only: the watcher poll, not this stream, is what tells firstmate the run finished.\n'
+    printf 'Ctrl-C stops watching and changes nothing about the run.\n\n'
+  fi
+
+  while :; do
+    now=$(date +%s)
+    remaining=$((deadline - now))
+    if [ "$remaining" -le 0 ]; then
+      give_up='the watch timeout expired'
+      break
+    fi
+    stream_attempt "$remaining"
+    if [ "$STREAM_TERMINAL" -eq 1 ]; then
+      break
+    fi
+    case ${STREAM_HTTP:-} in
+      410)
+        give_up='the stream for this run has expired, so its events are no longer available'
+        break ;;
+      401|403)
+        give_up="the Cursor API rejected the key for the stream (HTTP $STREAM_HTTP)"
+        break ;;
+      404)
+        give_up='the stream endpoint reported this run as not found'
+        break ;;
+      429)
+        give_up='the Cursor API rate limited the stream, so backing off rather than reconnecting'
+        break ;;
+      200|'') ;;
+      *)
+        give_up="the stream endpoint answered HTTP $STREAM_HTTP"
+        break ;;
+    esac
+    # A dropped or cut-off connection. Resume from the last event rather than
+    # replaying, and only while there is budget and the retention window holds.
+    now=$(date +%s)
+    # The attempt budget is checked FIRST, because when both limits have been
+    # reached it is the more precise cause: a watch with no reconnections left was
+    # never going to continue, whatever time remained.
+    if [ "$tries" -ge "$attempts" ]; then
+      give_up="the stream dropped and the $attempts reconnection attempt(s) allowed were used"
+      break
+    fi
+    if [ "$now" -ge "$deadline" ]; then
+      give_up='the watch timeout expired'
+      break
+    fi
+    if [ -n "$STREAM_RETENTION" ] && [ "$((now - start))" -gt "$STREAM_RETENTION" ]; then
+      give_up="the stream's ${STREAM_RETENTION}s retention window has passed, so it can no longer be resumed"
+      break
+    fi
+    tries=$((tries + 1))
+    if [ "$WATCH_JSON" -eq 0 ]; then
+      begin_line
+      printf '[stream] connection ended before the run did; reconnecting (%s of %s)%s\n' \
+        "$tries" "$attempts" "${LAST_EVENT_ID:+ from the last event seen}"
+    fi
+    sleep "$delay"
+    [ "$delay" -ge 8 ] && delay=8 || delay=$((delay * 2))
+  done
+
+  # Confirm against the run endpoint, always. The stream is the view; this is the
+  # fact - and it is also the fallback that makes an expired stream harmless.
+  local confirmed
+  confirmed=$(confirm_run_status)
+  status=${confirmed%%$'\t'*}
+  reason=${confirmed#*$'\t'}
+
+  if [ "$WATCH_JSON" -eq 1 ]; then
+    jq -nc --arg a "$agent" --arg r "$run" --arg s "$status" --arg reason "$reason" \
+      --arg give_up "$give_up" --argjson ev "$STREAM_EVENTS" --argjson hb "$STREAM_HEARTBEATS" \
+      --argjson tok "$STREAM_TOKENS" --argjson tries "$tries" \
+      --arg ret "$STREAM_RETENTION" --arg last "$LAST_EVENT_ID" \
+      --argjson terminal "$([ "$STREAM_TERMINAL" -eq 1 ] && echo true || echo false)" '{
+        schema: "fm-cursor-watch.v1", agentId: $a, runId: $r,
+        streamed: true,
+        streamReachedEnd: $terminal,
+        events: $ev, heartbeats: $hb, tokensObserved: $tok, reconnects: $tries,
+        retentionSeconds: (if $ret == "" then null else ($ret | tonumber) end),
+        lastEventId: (if $last == "" then null else $last end),
+        stoppedBecause: (if $give_up == "" then null else $give_up end),
+        runStatus: $s,
+        runStatusSource: "run-detail",
+        runStatusReason: (if $reason == "" then null else $reason end)
+      }'
+    return 0
+  fi
+
+  begin_line
+  echo
+  printf '%s event(s) seen' "$STREAM_EVENTS"
+  [ "$STREAM_HEARTBEATS" -eq 0 ] || printf ', %s heartbeat(s)' "$STREAM_HEARTBEATS"
+  [ "$STREAM_TOKENS" -eq 0 ] || printf ', %s token(s) reported' "$STREAM_TOKENS"
+  [ "$tries" -eq 0 ] || printf ', %s reconnection(s)' "$tries"
+  printf '.\n'
+  [ -z "$STREAM_RETENTION" ] || \
+    printf 'This run'"'"'s stream is retained for %ss from its start; after that only the run record remains.\n' \
+      "$STREAM_RETENTION"
+  if [ -n "$give_up" ]; then
+    printf 'Stopped watching: %s.\n' "$give_up"
+    printf 'That affects this live view only. The run itself is unaffected, and the watcher poll still reports its outcome.\n'
+  fi
+  if [ "$status" = unknown ]; then
+    printf 'The run record could not be read to confirm the outcome: %s\n' "$reason"
+  else
+    printf 'Run %s is %s, from the run record rather than from the stream.\n' "$run" "$status"
+  fi
 }
 
 # --- mutating verbs ---------------------------------------------------------
@@ -1134,8 +1776,8 @@ SUB=$1
 shift
 case $SUB in
   -h|--help|help) usage; exit 0 ;;
-  list|show|runs|usage|send|cancel|archive|unarchive|create) ;;
-  *) die 2 "unknown subcommand: $SUB (expected list, show, runs, usage, send, cancel, archive, unarchive, or create)" ;;
+  list|show|runs|usage|watch|send|cancel|archive|unarchive|create) ;;
+  *) die 2 "unknown subcommand: $SUB (expected list, show, runs, usage, watch, send, cancel, archive, unarchive, or create)" ;;
 esac
 
 require_tools

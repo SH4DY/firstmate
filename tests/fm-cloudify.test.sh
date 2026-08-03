@@ -274,8 +274,14 @@ git -C "$CLOUD_CLONE" push --quiet origin fm/t1
 
 # The API reports `main` here on purpose: that is the live misreport this design
 # must not trust. The return must still fast-forward fm/t1.
+# The list item carries NO `result`, which is what the live API actually returns -
+# verified 2026-08-01 - while the individual run carries it populated. The return
+# handoff is the only record of the cloud agent's reasoning, so a fixture that put
+# the result in the list item would let an empty handoff pass as correct.
 fixture "/v1/agents/bc-cloud111/runs?limit=1" \
-  '{"items":[{"id":"run-c1","status":"FINISHED","createdAt":"2026-08-01T10:00:00.000Z","durationMs":5000,"result":"I implemented the retry and rejected the queue approach because it reordered events.","git":{"branches":[{"repoUrl":"github.com/x/y","branch":"main"}]}}]}'
+  '{"items":[{"id":"run-c1","status":"FINISHED","createdAt":"2026-08-01T10:00:00.000Z","durationMs":5000,"git":{"branches":[{"repoUrl":"github.com/x/y","branch":"main"}]}}]}'
+fixture "/v1/agents/bc-cloud111/runs/run-c1" \
+  '{"id":"run-c1","status":"FINISHED","createdAt":"2026-08-01T10:00:00.000Z","durationMs":5000,"result":"I implemented the retry and rejected the queue approach because it reordered events.","git":{"branches":[{"repoUrl":"github.com/x/y","branch":"main"}]}}'
 fixture_post "/v1/agents/bc-cloud111/archive" '{"ok":true}'
 
 before=$(git -C "$WT" rev-parse HEAD)

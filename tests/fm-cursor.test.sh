@@ -48,6 +48,22 @@
 #   (v) the --no-runs footer never asserts an in-flight count
 #   (w) an API-supplied agent name carrying the record separator, a newline or a
 #       tab cannot split or truncate its table row
+#   (x) runs --json hydrates the `result` the LIST endpoint omits, from the
+#       individual run, and only for a run that can already have one; --no-result
+#       skips it, and a failed hydration degrades that one run with its reason
+#   (y) watch renders a live run as prose, counts heartbeats without ever printing
+#       them as content, ignores the duplicate interaction_update delta channel,
+#       and confirms the outcome against the run record rather than the stream
+#   (z) a mid-stream disconnect resumes with Last-Event-ID from the last event
+#       seen rather than replaying, within a bounded attempt budget
+#   (aa) 410 stream_expired falls back to the run record, a 429 backs off, and
+#       neither fails the command nor leaks the non-SSE error body as content
+#   (bb) watch --json emits one parseable object per event, heartbeats included,
+#       then one summary object carrying the poll-confirmed run state
+#   (cc) a run that has already ended is reported with its final text rather than
+#       replayed, unless --replay asks for the history
+#   (dd) watch refuses rather than attaching blind: no runs, or a run state that
+#       could not be determined
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -84,13 +100,23 @@ url=
 cfg=
 method=GET
 data=
+dump=
+want_code=0
+resume=
 while [ "$#" -gt 0 ]; do
   case $1 in
     --config) cfg=$2; shift 2 ;;
     -o) out=$2; shift 2 ;;
-    -w) shift 2 ;;
+    -w) want_code=1; shift 2 ;;
     -X) method=$2; shift 2 ;;
-    -H) shift 2 ;;
+    -D) dump=$2; shift 2 ;;
+    -H)
+      # A stream resume carries the last event id in a request header, and the
+      # test needs to see whether it was sent and with what value.
+      case $2 in
+        Last-Event-ID:*) resume=${2#Last-Event-ID: } ;;
+      esac
+      shift 2 ;;
     --data-binary) data=$2; shift 2 ;;
     -*) shift ;;
     *) url=$1; shift ;;
@@ -124,6 +150,30 @@ if [ -n "$cfg" ]; then
   printf '%s\n' "$cfg" >> "$FM_CURSOR_TEST_CFGS"
 fi
 slug=$(printf '%s' "${url#*://}" | sed 's/[^A-Za-z0-9]/_/g')
+# An event-stream request is answered on STDOUT rather than through -o, exactly
+# as the real curl streams it, with the status line and retention header written
+# to the -D file. `<slug>.sse` is the first connection and `<slug>.resume.sse`
+# the reconnection, so a test can prove a resume continued instead of restarting.
+case $url in
+  */stream)
+    printf '%s %s\n' "$method" "$url" >> "$FM_CURSOR_TEST_RESUMES"
+    [ -z "$resume" ] || printf 'RESUME %s\n' "$resume" >> "$FM_CURSOR_TEST_RESUMES"
+    scode=200
+    [ ! -f "$FM_CURSOR_TEST_FIXTURES/$slug.stream-code" ] \
+      || scode=$(cat "$FM_CURSOR_TEST_FIXTURES/$slug.stream-code")
+    if [ -n "$dump" ]; then
+      printf 'HTTP/2 %s \r\n' "$scode" > "$dump"
+      if [ -f "$FM_CURSOR_TEST_FIXTURES/$slug.retention" ]; then
+        printf 'x-cursor-stream-retention-seconds: %s\r\n' \
+          "$(cat "$FM_CURSOR_TEST_FIXTURES/$slug.retention")" >> "$dump"
+      fi
+      printf '\r\n' >> "$dump"
+    fi
+    body="$FM_CURSOR_TEST_FIXTURES/$slug.sse"
+    [ -z "$resume" ] || body="$FM_CURSOR_TEST_FIXTURES/$slug.resume.sse"
+    [ ! -f "$body" ] || cat "$body"
+    exit 0 ;;
+esac
 # A method-qualified fixture wins, so a POST and a GET on the same path can be
 # answered differently; an unqualified fixture still serves both.
 body="$FM_CURSOR_TEST_FIXTURES/${method}_$slug.json"
@@ -138,7 +188,9 @@ else
   [ -z "$out" ] || printf '{"message":"no fixture for %s"}' "$slug" > "$out"
   code=404
 fi
-printf '%s' "$code"
+# Only when -w asked for it, so a request reading its body from stdout never gets
+# a status code mixed into that body.
+[ "$want_code" -eq 0 ] || printf '%s' "$code"
 SH
 chmod +x "$FAKEBIN/curl"
 
@@ -147,7 +199,9 @@ export FM_CURSOR_TEST_KEY="$KEY"
 CALLS="$TMP_ROOT/calls"
 VIOLATIONS="$TMP_ROOT/violations"
 CFGS="$TMP_ROOT/cfgs"
+RESUMES="$TMP_ROOT/resumes"
 export FM_CURSOR_TEST_CALLS="$CALLS" FM_CURSOR_TEST_VIOLATIONS="$VIOLATIONS" FM_CURSOR_TEST_CFGS="$CFGS"
+export FM_CURSOR_TEST_RESUMES="$RESUMES"
 
 fixture() {  # <url-path> <json>
   local slug
@@ -190,6 +244,7 @@ run_cursor() {
   : > "$CALLS"
   : > "$VIOLATIONS"
   : > "$CFGS"
+  : > "$RESUMES"
   set +e
   OUT=$(PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_CONFIG_OVERRIDE="$CONFIG_DIR" \
     FM_CURSOR_API_BASE="https://api.cursor.com" "$CURSOR" "$@" 2>&1)
@@ -210,6 +265,7 @@ run_cursor_env() {  # <VAR=VALUE>... -- <args>...
   : > "$CALLS"
   : > "$VIOLATIONS"
   : > "$CFGS"
+  : > "$RESUMES"
   set +e
   OUT=$(PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_CONFIG_OVERRIDE="$CONFIG_DIR" \
     FM_CURSOR_API_BASE="https://api.cursor.com" env "${envs[@]}" "$CURSOR" "$@" 2>&1)
@@ -874,5 +930,356 @@ assert_contains "$OUT" "1 agent(s) shown" "the hostile name must not split the r
 assert_contains "$OUT" "FINISHED" "the hostile row still renders its run status"
 assert_contains "$OUT" "Break the row" "the separator and tab are collapsed to spaces"
 pass "an API-supplied name cannot split or truncate a table row"
+
+# --- (cc) runs --json hydrates the result the LIST endpoint omits -------------
+#
+# The list endpoint returns no `result` field even for a FINISHED run, while the
+# individual run returns it populated. bin/fm-bare-metal.sh writes its return
+# handoff from that field, so a consumer trusting the list item silently loses the
+# cloud agent's entire reasoning.
+
+AGENT_RESULT=bc-1010resu
+fixture "/v1/agents/$AGENT_RESULT/runs?limit=3" '{"items":[
+  {"id":"run-fin1","status":"FINISHED","createdAt":"2026-08-01T09:00:00.000Z",
+   "updatedAt":"2026-08-01T09:10:00.000Z","durationMs":600000,
+   "git":{"branches":[{"repoUrl":"github.com/snyk/minired","branch":"cursor/x"}]}},
+  {"id":"run-live1","status":"RUNNING","createdAt":"2026-08-01T09:20:00.000Z",
+   "updatedAt":"2026-08-01T09:21:00.000Z","durationMs":null,"git":{"branches":[]}},
+  {"id":"run-fin2","status":"FINISHED","createdAt":"2026-08-01T08:00:00.000Z",
+   "updatedAt":"2026-08-01T08:05:00.000Z","durationMs":300000,"git":{"branches":[]}}
+]}'
+fixture "/v1/agents/$AGENT_RESULT/runs/run-fin1" \
+  '{"id":"run-fin1","status":"FINISHED","durationMs":600000,"result":"THE FINAL TEXT the list endpoint omits","git":{"branches":[]}}'
+fixture "/v1/agents/$AGENT_RESULT/runs/run-fin2" \
+  '{"id":"run-fin2","status":"FINISHED","durationMs":300000,"git":{"branches":[]}}'
+
+run_cursor runs "$AGENT_RESULT" --limit 3 --json
+expect_code 0 "$RC" "runs --json succeeds while hydrating results"
+printf '%s' "$OUT" | jq -e '.runs[0].result == "THE FINAL TEXT the list endpoint omits"' >/dev/null \
+  || fail "a terminal run's result must be hydrated from the individual run: $OUT"
+printf '%s' "$OUT" | jq -e '.runs[0].resultSource == "run-detail"' >/dev/null \
+  || fail "the hydrated result must record where it came from: $OUT"
+printf '%s' "$OUT" | jq -e '.runs[1].resultSource == "pending" and .runs[1].result == null' >/dev/null \
+  || fail "a RUNNING run has no result yet and must not be hydrated: $OUT"
+printf '%s' "$OUT" | jq -e '.runs[2].resultSource == "absent"' >/dev/null \
+  || fail "a terminal run whose detail carries no result must read as absent, not as unavailable: $OUT"
+assert_no_grep "GET https://api.cursor.com/v1/agents/$AGENT_RESULT/runs/run-live1" "$CALLS" \
+  "hydration must cost no request for a run that cannot have a result yet"
+assert_grep "GET https://api.cursor.com/v1/agents/$AGENT_RESULT/runs/run-fin1" "$CALLS" \
+  "a terminal run with no result in the list item is fetched individually"
+pass "runs --json hydrates the result the list endpoint omits, and only where it can exist"
+
+run_cursor runs "$AGENT_RESULT" --limit 3 --json --no-result
+expect_code 0 "$RC" "runs --json --no-result succeeds"
+printf '%s' "$OUT" | jq -e '[.runs[].resultSource] | all(. == "skipped")' >/dev/null \
+  || fail "--no-result must skip hydration and say so: $OUT"
+assert_no_grep "/runs/run-fin1" "$CALLS" "--no-result must issue no per-run request"
+pass "--no-result skips hydration entirely"
+
+fixture_code "/v1/agents/$AGENT_RESULT/runs/run-fin1" 429
+fixture "/v1/agents/$AGENT_RESULT/runs/run-fin1" '{"message":"slow down"}'
+run_cursor runs "$AGENT_RESULT" --limit 3 --json
+expect_code 0 "$RC" "a failed hydration must not fail the whole history"
+printf '%s' "$OUT" | jq -e '.runs[0].resultSource == "unavailable"' >/dev/null \
+  || fail "a failed hydration must degrade to unavailable: $OUT"
+printf '%s' "$OUT" | jq -e '.runs[0].resultReason | test("429")' >/dev/null \
+  || fail "the degraded run must carry the reason, so a rate limit never reads as an empty result: $OUT"
+printf '%s' "$OUT" | jq -e '.count == 3' >/dev/null || fail "the rest of the history must survive: $OUT"
+printf '%s' "$OUT" | jq -e '[.runs[].resultSource] | index("needs-hydration") == null' >/dev/null \
+  || fail "the internal hydration marker must never reach a consumer: $OUT"
+rm -f "$FIXTURES/$(printf '%s' "api.cursor.com/v1/agents/$AGENT_RESULT/runs/run-fin1" | sed 's/[^A-Za-z0-9]/_/g').code"
+pass "a failed hydration degrades one run with its reason and keeps the rest"
+
+# --- watch fixtures ----------------------------------------------------------
+
+fixture_sse() {  # <url-path> <sse-text>
+  local slug
+  slug=$(printf '%s' "api.cursor.com$1" | sed 's/[^A-Za-z0-9]/_/g')
+  printf '%s' "$2" > "$FIXTURES/$slug.sse"
+}
+
+fixture_sse_resume() {  # <url-path> <sse-text>
+  local slug
+  slug=$(printf '%s' "api.cursor.com$1" | sed 's/[^A-Za-z0-9]/_/g')
+  printf '%s' "$2" > "$FIXTURES/$slug.resume.sse"
+}
+
+fixture_stream_code() {  # <url-path> <http-code>
+  local slug
+  slug=$(printf '%s' "api.cursor.com$1" | sed 's/[^A-Za-z0-9]/_/g')
+  printf '%s' "$2" > "$FIXTURES/$slug.stream-code"
+}
+
+fixture_retention() {  # <url-path> <seconds>
+  local slug
+  slug=$(printf '%s' "api.cursor.com$1" | sed 's/[^A-Za-z0-9]/_/g')
+  printf '%s' "$2" > "$FIXTURES/$slug.retention"
+}
+
+AGENT_WATCH=bc-2020watc
+WATCH_STREAM="/v1/agents/$AGENT_WATCH/runs/run-w1/stream"
+# The agent's latest run is RUNNING, so watch attaches instead of refusing...
+fixture "/v1/agents/$AGENT_WATCH/runs?limit=1" \
+  '{"items":[{"id":"run-w1","status":"RUNNING","createdAt":"2026-08-01T09:00:00.000Z","updatedAt":"2026-08-01T09:01:00.000Z","durationMs":null,"git":{"branches":[]}}]}'
+# ...and the run RECORD is what the outcome is confirmed against afterwards.
+fixture "/v1/agents/$AGENT_WATCH/runs/run-w1" \
+  '{"id":"run-w1","status":"FINISHED","durationMs":60000,"result":"the run record final text","git":{"branches":[]}}'
+fixture_retention "$WATCH_STREAM" 86400
+
+# --- (dd) a live run renders as readable prose, heartbeats excluded ----------
+
+fixture_sse "$WATCH_STREAM" 'id: ev-1
+event: status
+data: {"runId":"run-w1","status":"RUNNING"}
+
+id: ev-2
+event: thinking
+data: {"text":"weighing the options"}
+
+id: ev-3
+event: heartbeat
+data: {"beat":"NEVER_PRINT_THIS_HEARTBEAT"}
+
+id: ev-4
+event: interaction_update
+data: {"type":"text-delta","text":"NEVER_PRINT_THIS_DUPLICATE","tokens":7}
+
+id: ev-5
+event: assistant
+data: {"text":"the answer is 42"}
+
+id: ev-6
+event: tool_call
+data: {"callId":"c1","name":"read_file","status":"running"}
+
+id: ev-7
+event: tool_call
+data: {"callId":"c1","name":"read_file","status":"completed"}
+
+id: ev-8
+event: result
+data: {"runId":"run-w1","status":"FINISHED","text":"the stream final text"}
+
+id: ev-9
+event: done
+data: {}
+
+'
+
+run_cursor watch "$AGENT_WATCH"
+expect_code 0 "$RC" "watching a live run exits 0"
+assert_contains "$OUT" "[assistant] the answer is 42" "assistant text renders as prose"
+assert_contains "$OUT" "[thinking] weighing the options" "thinking renders as prose"
+assert_contains "$OUT" "[tool] read_file running" "a tool call renders its name and state"
+assert_contains "$OUT" "[tool] read_file completed" "a tool call's completion renders too"
+assert_contains "$OUT" "[result] FINISHED" "the result event renders"
+assert_contains "$OUT" "the stream final text" "the result text renders"
+assert_contains "$OUT" "[done]" "the done event ends the watch"
+assert_not_contains "$OUT" "NEVER_PRINT_THIS_HEARTBEAT" \
+  "a heartbeat must never be rendered as content"
+assert_not_contains "$OUT" "NEVER_PRINT_THIS_DUPLICATE" \
+  "interaction_update duplicates assistant/thinking and must not be printed twice"
+assert_contains "$OUT" "1 heartbeat(s)" "the heartbeat is still counted for liveness"
+assert_contains "$OUT" "7 token(s) reported" "token accounting comes from interaction_update"
+assert_contains "$OUT" "86400s" "the retention window the server reported is stated"
+assert_contains "$OUT" "is FINISHED, from the run record rather than from the stream" \
+  "the outcome is confirmed against the run record, not taken from the stream"
+assert_grep "GET https://api.cursor.com/v1/agents/$AGENT_WATCH/runs/run-w1" "$CALLS" \
+  "the run record is read to confirm the outcome"
+pass "watch renders a live run as readable prose and confirms the outcome against the poll's own source"
+
+# A paragraph break arrives as its own text delta carrying nothing but newlines.
+# Dropping it - which a command substitution does silently - runs the agent's
+# paragraphs together, so the rendered text has to preserve it.
+fixture_sse "$WATCH_STREAM" 'id: ev-1
+event: assistant
+data: {"text":"FIRST PARAGRAPH"}
+
+id: ev-2
+event: assistant
+data: {"text":"\n\n"}
+
+id: ev-3
+event: assistant
+data: {"text":"SECOND PARAGRAPH"}
+
+id: ev-4
+event: done
+data: {}
+
+'
+run_cursor watch "$AGENT_WATCH"
+expect_code 0 "$RC" "a stream whose deltas include a blank-line delta exits 0"
+assert_contains "$OUT" "FIRST PARAGRAPH" "the first paragraph renders"
+assert_contains "$OUT" "SECOND PARAGRAPH" "the second paragraph renders"
+assert_not_contains "$OUT" "FIRST PARAGRAPHSECOND PARAGRAPH" \
+  "a newline-only text delta must not be dropped, which would run paragraphs together"
+pass "a text delta that is only newlines is preserved rather than swallowed"
+
+# --- (ee) a mid-stream disconnect resumes from the last event seen -----------
+
+fixture_sse "$WATCH_STREAM" 'id: ev-1
+event: assistant
+data: {"text":"FIRST HALF ONLY"}
+
+id: ev-2
+event: thinking
+data: {"text":"still going"}
+
+'
+fixture_sse_resume "$WATCH_STREAM" 'id: ev-3
+event: assistant
+data: {"text":"SECOND HALF AFTER RESUME"}
+
+id: ev-4
+event: done
+data: {}
+
+'
+# A generous timeout so a heavily loaded machine cannot turn "the stream dropped
+# and was resumed" into "the watch timed out" and make this case flaky.
+run_cursor watch "$AGENT_WATCH" --attempts 2 --timeout 21600
+expect_code 0 "$RC" "a dropped stream that resumes still exits 0"
+assert_grep "RESUME ev-2" "$RESUMES" \
+  "the reconnection must carry Last-Event-ID with the last event actually seen"
+assert_contains "$OUT" "SECOND HALF AFTER RESUME" "the resumed stream's events are rendered"
+assert_contains "$OUT" "reconnecting (1 of 2)" "the reconnection is reported, not hidden"
+assert_contains "$OUT" "[done]" "the resumed stream reaches the end"
+[ "$(grep -c 'FIRST HALF ONLY' <<<"$OUT")" = 1 ] \
+  || fail "a resume must continue rather than replay from the start: $OUT"
+[ "$(grep -c 'GET .*/stream' "$RESUMES")" = 2 ] \
+  || fail "expected exactly two stream connections: $(cat "$RESUMES")"
+pass "a mid-stream disconnect resumes from the last event rather than restarting"
+
+run_cursor watch "$AGENT_WATCH" --attempts 0
+expect_code 0 "$RC" "--attempts 0 still exits 0 after the stream drops"
+assert_contains "$OUT" "reconnection attempt(s) allowed were used" \
+  "exhausting the attempt budget is reported as the reason"
+assert_contains "$OUT" "is FINISHED, from the run record" \
+  "an incomplete stream still reports the authoritative run state"
+assert_contains "$OUT" "the watcher poll still reports its outcome" \
+  "a degraded live view says plainly that the poll is unaffected"
+[ "$(grep -c 'GET .*/stream' "$RESUMES")" = 1 ] \
+  || fail "--attempts 0 must not reconnect: $(cat "$RESUMES")"
+pass "the reconnection budget is bounded and its exhaustion is reported, not hidden"
+
+# --- (ff) an expired stream falls back to the run record ---------------------
+
+fixture_stream_code "$WATCH_STREAM" 410
+fixture_sse "$WATCH_STREAM" '{"error":"stream_expired","message":"RAW_BODY_MUST_NOT_LEAK"}'
+run_cursor watch "$AGENT_WATCH"
+expect_code 0 "$RC" "an expired stream must not fail the command"
+assert_contains "$OUT" "expired" "the expiry is named as what happened"
+assert_contains "$OUT" "is FINISHED, from the run record rather than from the stream" \
+  "a 410 falls back to the run endpoint for terminal state"
+assert_not_contains "$OUT" "RAW_BODY_MUST_NOT_LEAK" \
+  "a non-SSE error body must never be rendered as stream content"
+[ "$(grep -c 'GET .*/stream' "$RESUMES")" = 1 ] \
+  || fail "an expired stream must not be retried: $(cat "$RESUMES")"
+pass "410 stream_expired falls back to the run record and says that is what happened"
+
+fixture_stream_code "$WATCH_STREAM" 429
+run_cursor watch "$AGENT_WATCH"
+expect_code 0 "$RC" "a rate-limited stream must not fail the command"
+assert_contains "$OUT" "rate limited" "the rate limit is named"
+assert_contains "$OUT" "is FINISHED, from the run record" "the run state is still reported"
+[ "$(grep -c 'GET .*/stream' "$RESUMES")" = 1 ] \
+  || fail "a rate-limited stream must back off rather than reconnect: $(cat "$RESUMES")"
+fixture_stream_code "$WATCH_STREAM" 200
+pass "a rate-limited stream backs off instead of reconnecting, and still reports the run"
+
+# --- (gg) --json emits one object per event, then one summary ----------------
+
+fixture_sse "$WATCH_STREAM" 'id: ev-1
+event: heartbeat
+data: {"beat":1}
+
+id: ev-2
+event: assistant
+data: {"text":"quoted \" and \\ and a tab\tinside"}
+
+id: ev-3
+event: done
+data: {}
+
+'
+run_cursor watch "$AGENT_WATCH" --json
+expect_code 0 "$RC" "watch --json exits 0"
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  printf '%s' "$line" | jq -e . >/dev/null 2>&1 \
+    || fail "every --json line must be one parseable JSON object; this one is not: $line"
+done <<< "$OUT"
+[ "$(printf '%s\n' "$OUT" | jq -r 'select(.schema == "fm-cursor-watch-event.v1") | .event' | tr '\n' ' ')" \
+  = "heartbeat assistant done " ] \
+  || fail "--json must carry every event including heartbeats, in order: $OUT"
+printf '%s\n' "$OUT" | tail -1 | jq -e '.schema == "fm-cursor-watch.v1"
+    and .streamReachedEnd == true and .heartbeats == 1 and .retentionSeconds == 86400
+    and .runStatus == "FINISHED" and .runStatusSource == "run-detail"' >/dev/null \
+  || fail "the last --json line must be the summary, with the poll-confirmed run state: $OUT"
+pass "watch --json emits one parseable object per event and a final summary"
+
+# --- (hh) a run that has already ended is not streamed unless asked ---------
+
+AGENT_DONE=bc-3030done
+fixture "/v1/agents/$AGENT_DONE/runs?limit=1" \
+  '{"items":[{"id":"run-d1","status":"FINISHED","createdAt":"2026-08-01T09:00:00.000Z","updatedAt":"2026-08-01T09:05:00.000Z","durationMs":300000,"git":{"branches":[]}}]}'
+fixture "/v1/agents/$AGENT_DONE/runs/run-d1" \
+  '{"id":"run-d1","status":"FINISHED","durationMs":300000,"result":"THE FINISHED RUN FINAL TEXT","git":{"branches":[]}}'
+fixture_sse "/v1/agents/$AGENT_DONE/runs/run-d1/stream" 'id: ev-1
+event: assistant
+data: {"text":"REPLAYED HISTORY"}
+
+id: ev-2
+event: done
+data: {}
+
+'
+run_cursor watch "$AGENT_DONE"
+expect_code 0 "$RC" "watching a finished run exits 0"
+assert_contains "$OUT" "has already ended: FINISHED" "a finished run is reported, not streamed"
+assert_contains "$OUT" "THE FINISHED RUN FINAL TEXT" "the agent's final text is what an operator wanted"
+assert_contains "$OUT" "--replay" "the replay option is offered rather than assumed"
+[ ! -s "$RESUMES" ] || fail "a finished run must not be streamed without --replay: $(cat "$RESUMES")"
+pass "a finished run answers with its final text instead of replaying thousands of events"
+
+run_cursor watch "$AGENT_DONE" --replay
+expect_code 0 "$RC" "--replay on a finished run exits 0"
+assert_contains "$OUT" "REPLAYED HISTORY" "--replay streams the run's history"
+assert_grep "/runs/run-d1/stream" "$RESUMES" "--replay does connect to the stream"
+pass "--replay streams a finished run's history on request"
+
+# --- (ii) watch usage errors and refusals -----------------------------------
+
+run_cursor watch
+expect_code 2 "$RC" "watch without an agent id exits 2"
+run_cursor watch "$AGENT_WATCH" --timeout 2
+expect_code 2 "$RC" "a --timeout below the allowed range exits 2"
+run_cursor watch "$AGENT_WATCH" --timeout 999999
+expect_code 2 "$RC" "a --timeout above the allowed range exits 2"
+run_cursor watch "$AGENT_WATCH" --timeout abc
+expect_code 2 "$RC" "a non-numeric --timeout exits 2"
+run_cursor watch "$AGENT_WATCH" --attempts 99
+expect_code 2 "$RC" "an out-of-range --attempts exits 2"
+run_cursor watch "$AGENT_WATCH" --run 'bad id'
+expect_code 2 "$RC" "an invalid run id exits 2"
+run_cursor watch "$AGENT_WATCH" --nonsense
+expect_code 2 "$RC" "an unknown watch option exits 2"
+assert_no_grep "stream" "$RESUMES" "no usage error may open a stream"
+
+AGENT_NORUNS=bc-4040none
+fixture "/v1/agents/$AGENT_NORUNS/runs?limit=1" '{"items":[]}'
+run_cursor watch "$AGENT_NORUNS"
+expect_code 5 "$RC" "an agent with no runs is a refusal, not a hang"
+assert_contains "$OUT" "no runs to watch" "the refusal names the situation"
+
+AGENT_BLIND=bc-5050blin
+fixture "/v1/agents/$AGENT_BLIND/runs?limit=1" '{"message":"slow down"}'
+fixture_code "/v1/agents/$AGENT_BLIND/runs?limit=1" 429
+run_cursor watch "$AGENT_BLIND"
+expect_code 5 "$RC" "an indeterminate run state refuses rather than attaching blind"
+assert_contains "$OUT" "Refusing to attach blind" "the refusal explains why"
+assert_contains "$OUT" "429" "the refusal carries the reason the state is unknown"
+pass "watch validates its options and refuses rather than attaching to nothing"
 
 printf '\nall fm-cursor tests passed\n'

@@ -2,7 +2,7 @@
 name: firstmate-cursor-cloud
 description: >-
   Agent-only playbook for reading, steering, and creating the captain's own Cursor Cloud agents without pretending they are a selectable runtime backend or a harness.
-  Use before reporting on Cursor Cloud agent activity, before answering what a cloud agent is doing or concluded, before sending a follow-up to or cancelling, archiving, or creating a cloud agent, and before responding to requests to make Cursor Cloud native to firstmate.
+  Use before reporting on Cursor Cloud agent activity, before answering what a cloud agent is doing or concluded, before attaching to a live cloud run's event stream, before sending a follow-up to or cancelling, archiving, or creating a cloud agent, and before responding to requests to make Cursor Cloud native to firstmate.
 user-invocable: false
 metadata:
   internal: true
@@ -79,6 +79,29 @@ Run status resolution prefers a `latestRunId` field that list items carry in pra
 If the fast path ever disappears the fallback keeps working, so treat a change there as a Cursor-side change rather than a firstmate defect.
 The fallback is always attempted when the fast path fails, and neither `list` nor `show` aborts when both fail: a stale run id says nothing about the agent, which the helper has usually just fetched successfully, so the run alone degrades to `unknown` with its reason.
 
+## Watching a run while it runs
+
+`bin/fm-cursor.sh watch <agent-id>` streams one run's events to the terminal.
+It exists because a run in flight is otherwise completely opaque, and it is the answer to "what is it actually doing right now" when reading `list` and `runs` is not enough.
+
+Three judgments are yours rather than the script's.
+
+**It is for the captain to watch, not for firstmate to sit in.**
+A stream is a foreground attach that occupies the session until the run ends or the timeout expires, so firstmate does not hold one open while supervising a fleet.
+Offer it, or run it when the captain asks what a run is doing and the answer needs the detail; otherwise `runs` and the poll are what supervision uses.
+
+**Never report a stream's last event as an outcome.**
+The watcher poll is what tells firstmate a cloud run finished, and `watch` confirms its own result against the run record for exactly that reason.
+If the two ever disagree, the run record wins and the stream was a stale view.
+A stream that dropped, expired, was rate limited, or timed out is not a failed run: it is a lost view of a run that is still going, which is why the command still succeeds and names what happened.
+
+**A finished run is answered, not replayed.**
+`watch` on a run that already ended reports its final state and the agent's own final text, because the stream would otherwise replay that run's entire history - thousands of events for a long run.
+Use `--replay` only when the captain wants the transcript of how a run reached its result, and say that is what you are producing.
+
+Report from it in the captain's nouns: what the cloud agent is doing now, what it just concluded, what tool it is using.
+`heartbeat` events are liveness only and are never content; if a stream carries nothing but heartbeats, the honest report is that the run is alive and quiet, not that it said something.
+
 ## Changing the fleet
 
 These verbs act on real agents that cost real quota, so treat them as you would any other outward-facing action.
@@ -134,8 +157,8 @@ A divergence means both sides moved and it needs a human; treat it as real work 
 
 - **It cannot delete.** `DELETE /v1/agents/{id}` is deliberately never wired, because it is permanent.
   `archive` is the cleanup verb and `unarchive` reverses it, so prefer archiving and say so rather than reaching for a destructive path that does not exist here.
-- **It cannot show a live run's progress.** The Cloud Agents API has no conversation or messages endpoint, so there is no cheap bounded read of an in-flight run.
-  A terminal run's final text is available through the API; for anything mid-run, escalate the URL rather than guessing.
+- **It cannot show a live run's progress in a cheap bounded read.** The Cloud Agents API has no conversation or messages endpoint, so there is no "capture the last 40 lines" equivalent for an in-flight run.
+  The only live window is `watch`, which is a streaming attach rather than a read, so it belongs to the section below and is never something to run mid-supervision just to see how a run is going.
 - **It cannot report money.** `usage` returns token counts only, because the Cloud Agents API exposes no price or charge field.
   Report tokens and run counts, say that cost is unavailable, and never estimate spend from token counts and a public price list.
 - **It sees only this operator's own agents.** A user API key is scoped to its own user, so this is not a company-wide fleet view.
