@@ -318,7 +318,7 @@ Unlike X mode, an ambient `CURSOR_API_KEY` in the environment does not activate 
 `FM_CURSOR_ENV_FILE` can point the helper at another `.env`-style file, and that file takes precedence over `$FM_HOME/.env`.
 The helper never reads the macOS keychain or `cursor-agent`'s stored credentials: those are undocumented, are not supported Cursor API credentials, and grant no access beyond the documented user key.
 
-The read subcommands are `list`, `show`, `runs`, and `usage`; the mutating ones are `send`, `cancel`, `archive`, `unarchive`, and `create`.
+The read subcommands are `list`, `show`, `runs`, `usage`, and `watch`; the mutating ones are `send`, `cancel`, `archive`, `unarchive`, and `create`.
 Every mutating subcommand requires an explicit agent id, with no most-recent default and no wildcard, because steering the wrong agent is not undone by re-running a command.
 `DELETE /v1/agents/{id}` is deliberately never wired: it is permanent, `archive` covers cleanup, and `unarchive` makes it reversible.
 Because one run can be active per agent, `send`, `cancel`, and `archive` read the latest run status first and refuse with an explanation naming the run rather than firing a request the API would answer with `409 agent_busy`; a run that starts in between still yields a clean refusal, and an indeterminate run state is also a refusal rather than an optimistic write.
@@ -330,6 +330,24 @@ Cursor Cloud is deliberately neither a runtime backend nor a harness; `.agents/s
 One behavior is worth stating here because it is the easiest thing to misread: an agent's `status` field is lifecycle only, with the enum `ACTIVE|ARCHIVED`, and Cursor documents execution status as living on runs instead.
 `ACTIVE` therefore means "not archived", never "currently running", so `bin/fm-cursor.sh list` resolves each agent's latest run and reports the run status enum as its primary column.
 `curl` and `jq` are required, the same pair X mode requires.
+
+A second behavior is worth stating because a consumer cannot see it from the data: the runs LIST endpoint omits each run's `result`, while the individual run endpoint returns it populated.
+A caller reading the list item therefore cannot tell "the agent said nothing" from "this endpoint does not carry it", which is how the return handoff below could be written empty.
+`runs --json` closes that by fetching the individual run for each terminal run whose list item has no result, records where each answer came from in `resultSource`, and offers `--no-result` to skip it; a still-running run costs no extra request, and a failed fetch degrades that one run with its reason rather than reading as an empty result.
+
+### Watching a live cloud run (fm-cursor.sh watch)
+
+`watch` streams one run's server-sent events to the terminal, which is the only way to see what a cloud run is doing while it runs: the Cloud Agents API has no conversation or messages endpoint, so the alternative is Cursor Web or nothing.
+
+It is foreground, bounded, and explicitly invoked, which is the whole point of its shape.
+Firstmate has one watcher and no per-task daemons, and an SSE connection is inherently long-lived, so `watch` runs only while an operator is watching it: an overall `--timeout` deadline is also handed to curl as `--max-time` on every connection, so no connection can outlive the command, and it creates no task record, arms no check, writes no state, and starts no background process.
+
+Streaming is an accelerator and a live view, never the authority.
+`bin/fm-cloudify-arm-check.sh` remains the only thing that guarantees firstmate learns a cloud run finished; `watch` neither arms it nor is consulted by it, and it confirms its own outcome against `GET /v1/agents/{id}/runs/{runId}` before reporting, so when the stream and the poll disagree the poll wins.
+No stream problem can fail the command: a dropped connection resumes from the last event with `Last-Event-ID` within a bounded attempt budget, a `410 stream_expired` falls back to the run record, a rate limit backs off, and every one of those outcomes is reported with its reason and still exits 0.
+The server reports the stream's retention window in `X-Cursor-Stream-Retention-Seconds`, which `watch` states rather than assuming a stream exists and declines to resume past.
+A run that has already ended is answered with its final text instead of replayed, because the stream replays a finished run's whole history and that is a transcript rather than a live view; `--replay` asks for it deliberately.
+The script header owns the exact flags, event handling, and JSON schemas.
 
 A Cursor agent maps onto a firstmate task, and a Cursor *environment* maps onto a project.
 An environment is a named, multi-repo, secret-bearing context, and `POST /v1/agents` accepts either a named environment or a bare repository list, which the API documents as mutually exclusive.
