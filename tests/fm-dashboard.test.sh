@@ -98,6 +98,12 @@ test_renders_fixture_snapshot() {
   assert_contains "$html" "building the dashboard" "dashboard did not render open workers"
   assert_contains "$html" "https://github.com/kunchenguid/firstmate/pull/99" "dashboard did not render full PR URL"
   assert_contains "$html" "<th>#</th>" "dashboard tables did not include a numbered column"
+  local landed_pos prs_pos attention_pos
+  landed_pos=${html%%Recently landed*}
+  prs_pos=${html%%PRs*}
+  attention_pos=${html%%Workers needing attention*}
+  [ "${#landed_pos}" -gt "${#prs_pos}" ] || fail "dashboard placed recently landed before PRs"
+  [ "${#landed_pos}" -gt "${#attention_pos}" ] || fail "dashboard placed recently landed before workers needing attention"
   [ "$(cat "$count_file")" -eq 1 ] || fail "dashboard did not call the snapshot once for one request"
   pass "dashboard renders HTML from a bearings snapshot fixture"
 }

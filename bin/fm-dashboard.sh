@@ -120,33 +120,44 @@ body {
   font: 15px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 }
 a { color: var(--nord8); }
-header, main { width: min(1180px, calc(100vw - 32px)); margin: 0 auto; }
-header { padding: 28px 0 18px; }
-h1 { margin: 0 0 8px; color: var(--nord8); font-size: 30px; letter-spacing: 0.02em; }
+header, main { width: min(1880px, calc(100vw - 24px)); margin: 0 auto; }
+header { padding: 22px 0 14px; }
+h1 { margin: 0 0 6px; color: var(--nord8); font-size: 28px; letter-spacing: 0.02em; }
 .subtitle { color: var(--nord5); }
-.meta { color: var(--nord3); margin-top: 6px; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 16px; padding-bottom: 28px; }
+.meta { color: var(--nord3); margin-top: 4px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 12px; padding-bottom: 22px; }
 .panel {
+  min-width: 0;
   background: var(--nord1);
   border: 1px solid var(--nord3);
-  border-radius: 12px;
-  padding: 16px;
-  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
+  border-radius: 10px;
+  padding: 12px;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.18);
 }
 .panel.full { grid-column: 1 / -1; }
-.panel h2 { margin: 0 0 12px; color: var(--nord8); font-size: 18px; }
+.panel h2 { margin: 0 0 8px; color: var(--nord8); font-size: 17px; }
 .panel.me { border-color: var(--nord13); }
 .panel.me h2, .wait { color: var(--nord13); }
 .good { color: var(--nord14); }
 .bad { color: var(--nord11); }
 .muted { color: var(--nord3); }
-table { width: 100%; border-collapse: collapse; }
-th, td { padding: 8px 7px; border-top: 1px solid var(--nord3); text-align: left; vertical-align: top; }
+table { width: 100%; max-width: 100%; border-collapse: collapse; }
+th, td {
+  min-width: 0;
+  padding: 5px 6px;
+  border-top: 1px solid var(--nord3);
+  text-align: left;
+  vertical-align: top;
+  line-height: 1.28;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
 th { color: var(--nord5); font-weight: 700; }
-td:first-child, th:first-child { width: 3.5rem; color: var(--nord3); }
-.empty { padding: 12px 0 0; color: var(--nord3); }
-pre { white-space: pre-wrap; word-break: break-word; margin: 0; }
-.badge { display: inline-block; border: 1px solid var(--nord3); border-radius: 999px; padding: 2px 8px; color: var(--nord5); }
+td:first-child, th:first-child { width: 2.5rem; color: var(--nord3); }
+a { overflow-wrap: anywhere; }
+.empty { padding: 8px 0 0; color: var(--nord3); }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal; margin: 0; }
+.badge { display: inline-block; border: 1px solid var(--nord3); border-radius: 999px; padding: 1px 7px; color: var(--nord5); }
 """
 
 
@@ -165,7 +176,7 @@ def value(row, key):
 def link(url):
     text = esc(url)
     if isinstance(url, str) and url.startswith("https://"):
-        return f'<a href="{text}">{text}</a>'
+        return f'<a href="{text}" title="{text}">{text}</a>'
     return text
 
 
@@ -222,27 +233,27 @@ def render_page(data, error=None):
                 esc(value(r, "owner") or value(r, "id")),
             ]),
             "</section>",
-            '<section class="panel"><h2>Workers</h2>',
+            '<section class="panel full"><h2>Workers</h2>',
             table(["Worker", "Status", "Doing"], workers, lambda r: [
                 esc(value(r, "id")), esc(value(r, "state")), esc(value(r, "doing")),
             ]),
             "</section>",
-            '<section class="panel"><h2>Waiting or queued</h2>',
+            '<section class="panel full"><h2>Waiting or queued</h2>',
             table(["Work", "Waiting on", "Reason"], waiting, lambda r: [
                 esc(value(r, "title") or value(r, "id")), esc(value(r, "owner") or value(r, "blocked_by")), esc(value(r, "reason")),
+            ]),
+            "</section>",
+            '<section class="panel full"><h2>PRs</h2>',
+            table(["Work", "URL"], prs, lambda r: [esc(value(r, "id")), link(value(r, "url"))]),
+            "</section>",
+            '<section class="panel full"><h2>Workers needing attention</h2>',
+            table(["Worker", "Problem", "Detail"], unhealthy, lambda r: [
+                esc(value(r, "id") or value(r, "window")), '<span class="bad">needs attention</span>', esc(value(r, "reason") or value(r, "summary") or value(r, "state")),
             ]),
             "</section>",
             '<section class="panel"><h2>Recently landed</h2>',
             table(["Work", "Result", "Artifact"], landed, lambda r: [
                 esc(value(r, "id")), f'<span class="good">{esc(value(r, "what"))}</span>', link(value(r, "artifact")),
-            ]),
-            "</section>",
-            '<section class="panel"><h2>PRs</h2>',
-            table(["Work", "URL"], prs, lambda r: [esc(value(r, "id")), link(value(r, "url"))]),
-            "</section>",
-            '<section class="panel"><h2>Workers needing attention</h2>',
-            table(["Worker", "Problem", "Detail"], unhealthy, lambda r: [
-                esc(value(r, "id") or value(r, "window")), '<span class="bad">needs attention</span>', esc(value(r, "reason") or value(r, "summary") or value(r, "state")),
             ]),
             "</section>",
             '<section class="panel"><h2>Available if expanded</h2>',
