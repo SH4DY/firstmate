@@ -177,15 +177,53 @@ test_help_includes_entire_header() {
   pass "fm-brief.sh: --help renders the complete header"
 }
 
-# Registry with one project per delivery mode, so each ship-mode DOD branch is
-# exercised. A project absent from the registry defaults to no-mistakes.
+# Registry with one project per delivery mode, plus entries that rely on the default.
 write_registry() {
   local home=$1
   mkdir -p "$home/data"
   cat > "$home/data/projects.md" <<'EOF'
+- implicit-proj - fixture for the default mode (added 2026-07-01)
+- yolo-only-proj [+yolo] - fixture for the default mode with yolo (added 2026-07-01)
+- nomistakes-proj [no-mistakes] - fixture for no-mistakes mode (added 2026-07-01)
+- nomistakes-yolo-proj [no-mistakes +yolo] - fixture for no-mistakes mode with yolo (added 2026-07-01)
 - direct-proj [direct-PR] - fixture for direct-PR mode (added 2026-07-01)
 - local-proj [local-only] - fixture for local-only mode (added 2026-07-01)
 EOF
+}
+
+test_project_mode_defaults_and_error_fallbacks() {
+  local home missing_home out project expected
+  home="$TMP_ROOT/mode-home"
+  missing_home="$TMP_ROOT/mode-missing-home"
+  write_registry "$home"
+
+  for expected in \
+    'implicit-proj:direct-PR off' \
+    'yolo-only-proj:direct-PR on' \
+    'nomistakes-proj:no-mistakes off' \
+    'nomistakes-yolo-proj:no-mistakes on'; do
+    project=${expected%%:*}
+    expected=${expected#*:}
+    out=$(FM_HOME="$home" "$ROOT/bin/fm-project-mode.sh" "$project")
+    [ "$out" = "$expected" ] || fail "$project resolved to $out, expected $expected"
+  done
+
+  out=$(FM_HOME="$missing_home" "$ROOT/bin/fm-project-mode.sh" absent 2>"$TMP_ROOT/missing-registry.err")
+  [ "$out" = 'no-mistakes off' ] || fail "missing registry did not preserve the no-mistakes fallback"
+  assert_grep 'mode=no-mistakes yolo=off' "$TMP_ROOT/missing-registry.err" \
+    "missing registry warning did not name both fallback values"
+
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-project-mode.sh" absent 2>"$TMP_ROOT/missing-project.err")
+  [ "$out" = 'no-mistakes off' ] || fail "missing project did not preserve the no-mistakes fallback"
+  assert_grep 'mode=no-mistakes yolo=off' "$TMP_ROOT/missing-project.err" \
+    "missing project warning did not name both fallback values"
+
+  printf '%s\n' '- unknown-proj [invalid] - fixture for invalid mode (added 2026-07-01)' >> "$home/data/projects.md"
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-project-mode.sh" unknown-proj 2>"$TMP_ROOT/unknown-mode.err")
+  [ "$out" = 'no-mistakes off' ] || fail "unknown mode did not preserve the no-mistakes fallback"
+  assert_grep 'mode=no-mistakes yolo=off' "$TMP_ROOT/unknown-mode.err" \
+    "unknown mode warning did not name both fallback values"
+  pass "fm-project-mode.sh: defaults direct-PR and preserves guarded error fallbacks"
 }
 
 # fm-brief.sh must exit 0 and produce a brief with no unreplaced shell
@@ -198,7 +236,7 @@ test_ship_modes_generate_clean_briefs() {
   home="$TMP_ROOT/ship-home"
   write_registry "$home"
 
-  for id_proj in "brief-nomistakes-a1:no-registry-proj" "brief-directpr-a2:direct-proj" "brief-localonly-a3:local-proj"; do
+  for id_proj in "brief-nomistakes-a1:nomistakes-proj" "brief-directpr-a2:direct-proj" "brief-localonly-a3:local-proj"; do
     id=${id_proj%%:*}
     proj=${id_proj##*:}
     FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" "$proj" >/dev/null 2>&1; status=$?
@@ -242,9 +280,9 @@ test_faster_paths_use_configured_authority_without_stacked_review() {
 test_no_mistakes_dod_wording() {
   local home id brief
   home="$TMP_ROOT/wording-home"
-  mkdir -p "$home/data"
+  write_registry "$home"
   id="brief-wording-b1"
-  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" nomistakes-proj >/dev/null 2>&1
   brief="$home/data/$id/brief.md"
   assert_present "$brief" "brief was not scaffolded"
   assert_grep "no-mistakes itself provides for the mechanics" "$brief" \
@@ -621,6 +659,7 @@ test_scout_and_secondmate_scaffold() {
 test_script_parses
 test_no_heredoc_in_command_substitution
 test_help_includes_entire_header
+test_project_mode_defaults_and_error_fallbacks
 test_ship_modes_generate_clean_briefs
 test_faster_paths_use_configured_authority_without_stacked_review
 test_no_mistakes_dod_wording
