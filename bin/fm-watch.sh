@@ -476,6 +476,50 @@ FM_ACTIVE_CHECK_PGID=
 FM_CHECK_OUTPUT=
 FM_CHECK_RESULT=
 FM_CHECK_SIGNAL_PENDING=
+FM_PR_POLL_WAKE_EVENT=
+FM_PR_POLL_WAKE_KIND=
+FM_PR_POLL_WAKE_HEAD=
+FM_PR_POLL_WAKE_FINGERPRINT=
+
+# Interpret only the trusted static poll's narrow result grammar. A non-terminal
+# event is selected only when its private marker proves it has not already
+# surfaced for this exact PR URL, head, and condition.
+# Returns 0 for one actionable result, 1 for no new result, and 2 for malformed
+# output or unsafe marker state, both of which remain silent.
+pr_poll_select_wake_event() {  # <state> <task-id> <provider> <url> <poll-output>
+  local state=$1 id=$2 provider=$3 url=$4 output=$5 line seen_rc selected=0
+  FM_PR_POLL_WAKE_EVENT=
+  FM_PR_POLL_WAKE_KIND=
+  FM_PR_POLL_WAKE_HEAD=
+  FM_PR_POLL_WAKE_FINGERPRINT=
+  if [ "$output" = merged ]; then
+    FM_PR_POLL_WAKE_EVENT=merged
+    return 0
+  fi
+  [ "$provider" = github ] || return 2
+  while IFS= read -r line || [ -n "$line" ]; do
+    fm_pr_poll_event_parse "$line" || return 2
+    seen_rc=0
+    fm_pr_poll_event_seen "$state" "$id" "$FM_PR_POLL_EVENT_KIND" "$url" \
+      "$FM_PR_POLL_EVENT_HEAD" "$FM_PR_POLL_EVENT_FINGERPRINT" || seen_rc=$?
+    case "$seen_rc" in
+      0) ;;
+      1)
+        if [ "$selected" -eq 0 ]; then
+          FM_PR_POLL_WAKE_EVENT=$line
+          FM_PR_POLL_WAKE_KIND=$FM_PR_POLL_EVENT_KIND
+          FM_PR_POLL_WAKE_HEAD=$FM_PR_POLL_EVENT_HEAD
+          FM_PR_POLL_WAKE_FINGERPRINT=$FM_PR_POLL_EVENT_FINGERPRINT
+          selected=1
+        fi
+        ;;
+      *) return 2 ;;
+    esac
+  done <<EOF
+$output
+EOF
+  [ "$selected" -eq 1 ] || return 1
+}
 
 fm_check_output_cleanup() {
   [ -z "$FM_CHECK_OUTPUT" ] || rm -f -- "$FM_CHECK_OUTPUT"
@@ -772,18 +816,45 @@ while :; do
         fi
       fi
       if [ -n "$out" ]; then
-        reason="check: $c: $out"
-        fm_wake_append check "$c" "$reason" || exit 1
-        if [ "$is_pr_poll" -eq 1 ] && [ "$out" = merged ]; then
-          if fm_pr_poll_retirement_publish "$STATE" "$id" "$SCRIPT_DIR/fm-pr-poll.sh" "$out"; then
-            fm_pr_poll_retirement_recover_one "$STATE" "$id" "$SCRIPT_DIR/fm-pr-poll.sh" \
-              || triage_log "merged PR poll retirement remains recoverable for $id"
-          else
-            triage_log "merged PR poll retirement deferred because its canonical snapshot changed for $id"
-          fi
+        check_key=$c
+        pr_event=0
+        if [ "$is_pr_poll" -eq 1 ]; then
+          event_rc=0
+          pr_poll_select_wake_event "$STATE" "$id" "$FM_PR_POLL_SNAPSHOT_PROVIDER" \
+            "$FM_PR_POLL_SNAPSHOT_URL" "$out" || event_rc=$?
+          case "$event_rc" in
+            0)
+              out=$FM_PR_POLL_WAKE_EVENT
+              if [ "$out" != merged ]; then
+                pr_event=1
+                # Each distinct non-terminal event gets a queue key of its own,
+                # so a restart before the queue drains cannot replace a behind
+                # notification with a later CI-failure notification.
+                check_key="$c:$out"
+              fi
+              ;;
+            1) out= ;;
+            *) triage_log "ignored malformed or unsafe PR poll event for $id"; out= ;;
+          esac
         fi
-        touch "$STATE/.last-check"
-        wake "$reason"
+        if [ -n "$out" ]; then
+          reason="check: $c: $out"
+          fm_wake_append check "$check_key" "$reason" || exit 1
+          if [ "$is_pr_poll" -eq 1 ] && [ "$out" = merged ]; then
+            if fm_pr_poll_retirement_publish "$STATE" "$id" "$SCRIPT_DIR/fm-pr-poll.sh" "$out"; then
+              fm_pr_poll_retirement_recover_one "$STATE" "$id" "$SCRIPT_DIR/fm-pr-poll.sh" \
+                || triage_log "merged PR poll retirement remains recoverable for $id"
+            else
+              triage_log "merged PR poll retirement deferred because its canonical snapshot changed for $id"
+            fi
+          elif [ "$pr_event" -eq 1 ]; then
+            fm_pr_poll_event_mark_seen "$STATE" "$id" "$FM_PR_POLL_WAKE_KIND" \
+              "$FM_PR_POLL_SNAPSHOT_URL" "$FM_PR_POLL_WAKE_HEAD" \
+              "$FM_PR_POLL_WAKE_FINGERPRINT" || exit 1
+          fi
+          touch "$STATE/.last-check"
+          wake "$reason"
+        fi
       fi
     done
     if [ -n "$rejected_checks" ]; then

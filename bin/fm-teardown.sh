@@ -293,7 +293,7 @@ retire_busy_state() {
 }
 
 validate_pr_poll_cleanup() {
-  local state_dir=$1 id=$2 quarantine state_device artifact has_artifact=0
+  local state_dir=$1 id=$2 quarantine state_device artifact marker has_artifact=0
   fm_task_id_path_safe "$id" || return 0
   quarantine="$state_dir/.pr-check-quarantine"
   if [ "$id" = _noncanonical ] \
@@ -306,8 +306,12 @@ validate_pr_poll_cleanup() {
   fi
   for artifact in "$state_dir/$id.check.sh" "$state_dir/$id.pr-poll" \
     "$state_dir/$id.pr-poll-registration" "$state_dir/$id.pr-poll-retirement" \
-    "$state_dir/$id.check-trust"; do
+    "$state_dir/$id.check-trust" "$state_dir/$id.pr-ci-fix-count"; do
     [ -e "$artifact" ] || [ -L "$artifact" ] || continue
+    has_artifact=1
+  done
+  for marker in "$state_dir/.pr-poll-event-$id-behind" "$state_dir/.pr-poll-event-$id-ci-"*; do
+    [ -e "$marker" ] || [ -L "$marker" ] || continue
     has_artifact=1
   done
   if [ -e "$quarantine" ] || [ -L "$quarantine" ]; then
@@ -318,7 +322,7 @@ validate_pr_poll_cleanup() {
   state_device=$(fm_pr_file_device "$state_dir") || return 1
   for artifact in "$state_dir/$id.check.sh" "$state_dir/$id.pr-poll" \
     "$state_dir/$id.pr-poll-registration" "$state_dir/$id.pr-poll-retirement" \
-    "$state_dir/$id.check-trust"; do
+    "$state_dir/$id.check-trust" "$state_dir/$id.pr-ci-fix-count"; do
     [ -e "$artifact" ] || [ -L "$artifact" ] || continue
     if [ ! -f "$artifact" ] || [ -L "$artifact" ] \
       || [ "$(fm_pr_file_device "$artifact")" != "$state_device" ] \
@@ -327,6 +331,16 @@ validate_pr_poll_cleanup() {
       return 1
     fi
   done
+  if [ -e "$state_dir/$id.pr-ci-fix-count" ] || [ -L "$state_dir/$id.pr-ci-fix-count" ]; then
+    if ! fm_pr_ci_fix_count_file_valid "$state_dir/$id.pr-ci-fix-count" "$state_device"; then
+      echo "REFUSED: invalid CI fix count; preserving task state." >&2
+      return 1
+    fi
+  fi
+  if ! fm_pr_poll_event_markers_valid "$state_dir" "$id"; then
+    echo "REFUSED: unsafe PR-poll event marker; preserving task state." >&2
+    return 1
+  fi
   if [ -e "$state_dir/$id.pr-poll-retirement" ] \
     || [ -L "$state_dir/$id.pr-poll-retirement" ]; then
     fm_pr_poll_retirement_state_valid "$state_dir" "$id" || {
@@ -361,6 +375,8 @@ remove_pr_poll_artifacts() {
   rm -f "$state_dir/$id.check.sh" "$state_dir/$id.pr-poll" \
     "$state_dir/$id.pr-poll-registration" "$state_dir/$id.pr-poll-retirement" \
     "$state_dir/$id.check-trust" || return 1
+  fm_pr_poll_event_markers_remove "$state_dir" "$id" || return 1
+  fm_pr_ci_fix_count_remove "$state_dir" "$id" || return 1
   if fm_task_id_path_safe "$id"; then
     quarantine="$state_dir/.pr-check-quarantine"
     if [ -d "$quarantine" ] && [ ! -L "$quarantine" ]; then
