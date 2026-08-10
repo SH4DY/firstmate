@@ -64,12 +64,27 @@ SH
   cat > "$fakebin/gh" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_GH_LOG"
-case " $* " in
-  *" headRefOid "*) printf '%s\n' "${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}" ;;
-  *" state "*)
+case "${1:-} ${2:-}" in
+  "api graphql")
     [ "${FM_TEST_GH_FAIL:-0}" = 0 ] || exit 1
     [ "${FM_TEST_GH_SLEEP:-0}" = 0 ] || sleep "$FM_TEST_GH_SLEEP"
-    printf '%s\n' "${FM_TEST_GH_STATE:-OPEN}"
+    if [ "${FM_TEST_GH_GRAPHQL_OUTPUT+x}" = x ]; then
+      printf '%s\n' "$FM_TEST_GH_GRAPHQL_OUTPUT"
+    else
+      printf 'meta\t%s\t%s\t%s\ncomplete\n' \
+        "${FM_TEST_GH_STATE:-OPEN}" "${FM_TEST_GH_MERGE_STATUS:-CLEAN}" \
+        "${FM_TEST_GH_POLL_HEAD:-0123456789abcdef0123456789abcdef01234567}"
+    fi
+    ;;
+  "pr view")
+    case " $* " in
+      *" headRefOid "*) printf '%s\n' "${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}" ;;
+      *" state "*)
+        [ "${FM_TEST_GH_FAIL:-0}" = 0 ] || exit 1
+        [ "${FM_TEST_GH_SLEEP:-0}" = 0 ] || sleep "$FM_TEST_GH_SLEEP"
+        printf '%s\n' "${FM_TEST_GH_STATE:-OPEN}"
+        ;;
+    esac
     ;;
 esac
 SH
@@ -2603,7 +2618,7 @@ SH
 }
 
 test_teardown_removes_poll_artifacts() {
-  local dir fakebin kind artifact counterpart rc
+  local dir fakebin kind artifact counterpart rc event_url event_head
   dir=$(make_case teardown-cleanup)
   fakebin="$dir/fakebin"
   fm_write_meta "$dir/home/state/task-a.meta" \
@@ -2617,6 +2632,12 @@ test_teardown_removes_poll_artifacts() {
   printf 'data\n' > "$dir/home/state/task-a.pr-poll"
   printf 'registration\n' > "$dir/home/state/task-a.pr-poll-registration"
   printf 'trust\n' > "$dir/home/state/task-a.check-trust"
+  event_url=https://github.com/o/r/pull/17
+  event_head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  fm_pr_poll_event_mark_seen "$dir/home/state" task-a behind "$event_url" "$event_head" \
+    || fail "could not seed teardown event marker"
+  fm_pr_ci_fix_count_claim "$dir/home/state" task-a "$event_url" \
+    || fail "could not seed teardown CI repair count"
   mkdir -p "$dir/home/state/.pr-check-quarantine"
   chmod 0700 "$dir/home/state/.pr-check-quarantine"
   printf 'legacy\n' > "$dir/home/state/.pr-check-quarantine/task-a.check.abc123"
@@ -2635,6 +2656,9 @@ SH
   [ ! -e "$dir/home/state/task-a.pr-poll" ] || fail "teardown left the sidecar"
   [ ! -e "$dir/home/state/task-a.pr-poll-registration" ] || fail "teardown left the PR poll registration"
   [ ! -e "$dir/home/state/task-a.check-trust" ] || fail "teardown left the custom check registration"
+  [ ! -e "$dir/home/state/task-a.pr-ci-fix-count" ] || fail "teardown left the CI repair count"
+  ! find "$dir/home/state" -maxdepth 1 -name '.pr-poll-event-task-a-*' -print | grep . >/dev/null \
+    || fail "teardown left PR-poll event markers"
   ! find "$dir/home/state/.pr-check-quarantine" -name 'task-a.*' -print 2>/dev/null | grep . >/dev/null \
     || fail "teardown left task quarantine artifacts"
 
@@ -3325,8 +3349,124 @@ test_gitlab_merged_poll_retires() {
   pass "GitHub and GitLab exact merged results share one retirement path"
 }
 
+test_pr_poll_actionable_events_and_suppression() {
+  local dir state head_one head_two head_three unit lint raw rc
+  dir=$(make_case pr-poll-actionable-events)
+  state="$dir/home/state"
+  head_one=1111111111111111111111111111111111111111
+  head_two=2222222222222222222222222222222222222222
+  head_three=3333333333333333333333333333333333333333
+  unit=$(printf '%s' 'check-run:dW5pdA==' | shasum -a 256 | awk '{print $1}')
+  lint=$(printf '%s' 'check-run:bGludA==' | shasum -a 256 | awk '{print $1}')
+  write_poll_meta "$state" task-a https://github.com/o/r/pull/25
+  seed_canonical_poll "$dir" task-a https://github.com/o/r/pull/25
+  add_stop_custom_check "$dir"
+
+  set +e
+  FM_TEST_GH_MERGE_STATUS=BEHIND FM_TEST_GH_POLL_HEAD="$head_one" \
+    run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/behind-one.out" 2> "$dir/behind-one.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "behind event watcher failed: $(cat "$dir/behind-one.err")"
+  assert_grep "check: $state/task-a.check.sh: behind $head_one" "$dir/behind-one.out" \
+    "behind base state did not wake"
+  [ -f "$state/.pr-poll-event-task-a-behind" ] || fail "behind event did not persist its suppression marker"
+
+  rm -f "$state/.last-check"
+  set +e
+  FM_TEST_GH_MERGE_STATUS=BEHIND FM_TEST_GH_POLL_HEAD="$head_one" \
+    run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/behind-repeat.out" 2> "$dir/behind-repeat.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "repeated behind watcher failed: $(cat "$dir/behind-repeat.err")"
+  assert_no_grep "behind $head_one" "$dir/behind-repeat.out" \
+    "unchanged behind state woke more than once"
+  assert_grep "check: $state/z-stop.check.sh: stop-cycle" "$dir/behind-repeat.out" \
+    "suppressed behind poll did not continue to the next check"
+
+  rm -f "$state/.last-check"
+  set +e
+  FM_TEST_GH_MERGE_STATUS=BEHIND FM_TEST_GH_POLL_HEAD="$head_two" \
+    run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/behind-head-change.out" 2> "$dir/behind-head-change.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "changed-head behind watcher failed: $(cat "$dir/behind-head-change.err")"
+  assert_grep "check: $state/task-a.check.sh: behind $head_two" "$dir/behind-head-change.out" \
+    "a new head did not re-wake the behind condition"
+
+  raw=$(printf 'meta\tOPEN\tCLEAN\t%s\ncheck-run\ttrue\tCOMPLETED\tFAILURE\tdW5pdA==\ncomplete' "$head_three")
+  rm -f "$state/.last-check"
+  set +e
+  FM_TEST_GH_GRAPHQL_OUTPUT="$raw" run_watcher_bounded "$dir/home" "$dir/fakebin" \
+    > "$dir/ci-one.out" 2> "$dir/ci-one.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "required CI failure watcher failed: $(cat "$dir/ci-one.err")"
+  assert_grep "check: $state/task-a.check.sh: ci-failed $head_three $unit" "$dir/ci-one.out" \
+    "required concluded failure did not wake"
+
+  rm -f "$state/.last-check"
+  set +e
+  FM_TEST_GH_GRAPHQL_OUTPUT="$raw" run_watcher_bounded "$dir/home" "$dir/fakebin" \
+    > "$dir/ci-repeat.out" 2> "$dir/ci-repeat.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "repeated required CI watcher failed: $(cat "$dir/ci-repeat.err")"
+  assert_no_grep "ci-failed $head_three $unit" "$dir/ci-repeat.out" \
+    "unchanged failed check woke more than once"
+
+  raw=$(printf 'meta\tOPEN\tCLEAN\t%s\ncheck-run\tfalse\tCOMPLETED\tFAILURE\tdW5pdA==\ncomplete' "$head_three")
+  rm -f "$state/.last-check"
+  set +e
+  FM_TEST_GH_GRAPHQL_OUTPUT="$raw" run_watcher_bounded "$dir/home" "$dir/fakebin" \
+    > "$dir/nonrequired.out" 2> "$dir/nonrequired.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "non-required failure watcher failed: $(cat "$dir/nonrequired.err")"
+  assert_no_grep 'ci-failed' "$dir/nonrequired.out" "non-required failure woke the watcher"
+
+  raw=$(printf 'meta\tOPEN\tCLEAN\t%s\ncheck-run\ttrue\tIN_PROGRESS\tnull\tbGludA==\ncomplete' "$head_three")
+  rm -f "$state/.last-check"
+  set +e
+  FM_TEST_GH_GRAPHQL_OUTPUT="$raw" run_watcher_bounded "$dir/home" "$dir/fakebin" \
+    > "$dir/running.out" 2> "$dir/running.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "running check watcher failed: $(cat "$dir/running.err")"
+  assert_no_grep 'ci-failed' "$dir/running.out" "running required check woke the watcher"
+
+  raw=$(printf 'meta\tOPEN\tCLEAN\t%s\ncheck-run\ttrue\tCOMPLETED\tFAILURE\tbGludA==\ncomplete' "$head_three")
+  rm -f "$state/.last-check"
+  set +e
+  FM_TEST_GH_GRAPHQL_OUTPUT="$raw" run_watcher_bounded "$dir/home" "$dir/fakebin" \
+    > "$dir/different-check.out" 2> "$dir/different-check.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "different failing check watcher failed: $(cat "$dir/different-check.err")"
+  assert_grep "check: $state/task-a.check.sh: ci-failed $head_three $lint" "$dir/different-check.out" \
+    "a different failed required check did not wake"
+
+  dir=$(make_case pr-poll-merged-priority)
+  state="$dir/home/state"
+  write_poll_meta "$state" task-a https://github.com/o/r/pull/26
+  seed_canonical_poll "$dir" task-a https://github.com/o/r/pull/26
+  raw=$(printf 'meta\tMERGED\tBEHIND\t%s\ncheck-run\ttrue\tCOMPLETED\tFAILURE\tdW5pdA==\ncomplete' "$head_one")
+  set +e
+  FM_TEST_GH_GRAPHQL_OUTPUT="$raw" run_watcher_bounded "$dir/home" "$dir/fakebin" \
+    > "$dir/merged-priority.out" 2> "$dir/merged-priority.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "merged priority watcher failed: $(cat "$dir/merged-priority.err")"
+  assert_grep "check: $state/task-a.check.sh: merged" "$dir/merged-priority.out" \
+    "merged PR did not win poll output priority"
+  assert_no_grep 'behind ' "$dir/merged-priority.out" "merged PR also emitted a behind event"
+  assert_no_grep 'ci-failed' "$dir/merged-priority.out" "merged PR also emitted a CI event"
+  pass "GitHub PR polling wakes once for behind and required CI failures without polling noise"
+}
+
 test_parser_matrix
 test_gitlab_merge_watch
+test_pr_poll_actionable_events_and_suppression
 test_merged_poll_retires_once
 test_persistent_secondmate_retirement_is_poll_only
 test_retirement_crash_recovery

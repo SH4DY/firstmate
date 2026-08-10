@@ -192,6 +192,7 @@ No armed watch is lost by upgrading.
 
 ## What this change does not cover
 
+GitLab polling remains merge-only because the supported plain `glab` output has no portable pull-request-scoped required-check field equivalent to GitHub's `isRequired` field.
 `bin/fm-pr-merge.sh` still addresses GitHub only, by owner and repository.
 It refuses a GitLab merge request URL rather than sending it to the wrong forge, so merging a merge request stays a deliberate manual step until merge parity lands separately.
 
