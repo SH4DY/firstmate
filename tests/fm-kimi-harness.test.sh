@@ -167,7 +167,7 @@ run_spawn() {
     FM_FAKE_BRIEF_REAL="$(cd "$home/data/$id" && pwd -P)/brief.md" \
     FM_KIMI_READY_POLLS=2 FM_KIMI_DELIVERY_POLLS=2 FM_KIMI_POLL_INTERVAL=0 \
     PATH="$fakebin:$BASE_PATH" \
-    "$SPAWN" "$id" "$proj" --harness kimi "$@" 2>&1
+    "$SPAWN" "$id" "$proj" --harness kimi --mode no-mistakes --yolo off "$@" 2>&1
 }
 
 read_spawn_record() {
@@ -192,7 +192,7 @@ test_kimi_launch_then_send_is_verified() {
   assert_contains "$out" "spawned $id harness=kimi" "kimi spawn did not report success"
 
   launch=$(cat "$CASE_DIR/launch.log")
-  [ "$launch" = "'$FAKEBIN_DIR/kimi' --model 'kimi-code/k3' --auto" ] \
+  [ "$launch" = "env -u CURSOR_AGENT -u CURSOR_INVOKED_AS '$FAKEBIN_DIR/kimi' --model 'kimi-code/k3' --auto" ] \
     || fail "kimi launch did not use the absolute binary, model, and --auto only: $launch"
   assert_not_contains "$launch" "--effort" "kimi launch emitted a nonexistent effort flag"
   assert_not_contains "$launch" "turn-ended" "kimi launch embedded a turn-end path"
@@ -449,7 +449,7 @@ test_kimi_falls_back_to_expanded_home_binary() {
   rc=$?
   expect_code 0 "$rc" "Kimi HOME fallback spawn should succeed"
   launch=$(cat "$CASE_DIR/launch.log")
-  [ "$launch" = "'$fallback' --auto" ] \
+  [ "$launch" = "env -u CURSOR_AGENT -u CURSOR_INVOKED_AS '$fallback' --auto" ] \
     || fail "Kimi fallback did not expand HOME into an absolute executable: $launch"
   pass "fm-spawn: Kimi fallback expands the active HOME"
 }
