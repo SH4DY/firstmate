@@ -25,6 +25,15 @@ fi
   echo 'REFUSED: unsafe remediation state directory; preserving task state.' >&2
   exit 1
 }
+# No remediation artifacts means no filesystem-identity read is needed.
+# Keep unrelated cleanup paths independent of these optional records.
+HAS_ARTIFACT=0
+for artifact in "$STATE/$ID.pr-ci-fix-count" \
+  "$STATE/.pr-poll-event-$ID-behind" "$STATE/.pr-poll-event-$ID-ci-"*; do
+  [ -e "$artifact" ] || [ -L "$artifact" ] || continue
+  HAS_ARTIFACT=1
+done
+[ "$HAS_ARTIFACT" -eq 1 ] || exit 0
 STATE_DEVICE=$(fm_pr_file_device "$STATE") || exit 1
 if [ -e "$STATE/$ID.pr-ci-fix-count" ] || [ -L "$STATE/$ID.pr-ci-fix-count" ]; then
   fm_pr_ci_fix_count_file_valid "$STATE/$ID.pr-ci-fix-count" "$STATE_DEVICE" || {
