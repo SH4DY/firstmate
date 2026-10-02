@@ -3106,9 +3106,9 @@ test_away_branch_actor_merges_green_under_the_record() {
     > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
-  expect_code 2 "$rc" "away-branch-red: --allow-red must stay attended-only for the branch"
-  assert_grep 'allow-red is attended-only' "$case_dir/stderr" \
-    "away-branch-red: refusal did not name the attended-only waiver"
+  expect_code 2 "$rc" "away-branch-red: --allow-red must always be forbidden"
+  assert_grep 'allow-red is forbidden' "$case_dir/stderr" \
+    "away-branch-red: refusal did not name the absolute red-merge prohibition"
   assert_no_grep 'pr merge' "$case_dir/gh.log" \
     "away-branch-red: gh pr merge ran for a waived red branch merge while away"
   pass "under the away-posture record the branch merges a green task, is refused on a red check with or without --allow-red, and is refused at the partition while attended"

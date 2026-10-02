@@ -996,6 +996,12 @@ fm_pr_poll_event_markers_valid() {  # <state> <task-id>
 
 fm_pr_poll_event_markers_remove() {  # <state> <task-id>
   local state=$1 id=$2 state_device marker basename
+  fm_pr_task_id_valid "$id" || return 1
+  # Remote secondmate control records live inside the home just retired.
+  # An absent directory has no markers left; a dangling symlink is not absence.
+  if [ ! -e "$state" ] && [ ! -L "$state" ]; then
+    return 0
+  fi
   fm_pr_poll_event_markers_valid "$state" "$id" || return 1
   state_device=$(fm_pr_file_device "$state") || return 1
   for marker in "$state/.pr-poll-event-$id-behind" "$state/.pr-poll-event-$id-ci-"*; do

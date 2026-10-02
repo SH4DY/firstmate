@@ -228,7 +228,11 @@ assert_grep "worktree=$WT" "$HOME_DIR/state/t1.meta" "the task keeps its worktre
 
 assert_present "$HOME_DIR/state/t1.check.sh" "a poll is armed"
 assert_present "$HOME_DIR/state/t1.check-trust" "the poll is registered, not just written"
-perms=$(stat -f '%Lp' "$HOME_DIR/state/t1.check.sh" 2>/dev/null || stat -c '%a' "$HOME_DIR/state/t1.check.sh")
+if [ "$(uname)" = Darwin ]; then
+  perms=$(stat -f '%Lp' "$HOME_DIR/state/t1.check.sh")
+else
+  perms=$(stat -c '%a' "$HOME_DIR/state/t1.check.sh")
+fi
 [ "$perms" = 700 ] || fail "the armed check must be mode 0700, got $perms"
 
 jq -e '.workOnCurrentBranch == true' "$BODIES" >/dev/null \
@@ -352,7 +356,7 @@ pass "bare-metal refuses a divergence rather than forcing over the cloud agent's
 # request. These use their own fixtures so t1's mutated end state cannot mask the
 # result.
 
-REPO2="$TMP_ROOT/repo2"; WT2="$TMP_ROOT/wt-t2"; BARE2="$REPO2.origin.git"
+REPO2="$TMP_ROOT/repo2"; WT2="$TMP_ROOT/wt-t2"
 fm_git_worktree "$REPO2" "$WT2" fm/t2
 # Deliberately WITHOUT -u: this is the state the defect mishandled.
 git -C "$WT2" push --quiet origin fm/t2

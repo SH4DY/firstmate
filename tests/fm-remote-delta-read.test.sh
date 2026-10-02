@@ -125,42 +125,66 @@ assert_contains "$OUT" 'reason=prefix-changed' 'the same-size rewrite was not na
 assert_contains "$OUT" 'to_offset=11' 'the break did not report the current size'
 pass 'a same-size in-place rewrite breaks continuity as prefix-changed'
 
-# A same-size rewrite of the same inode within the snapshot's own second leaves
-# size, inode, device, and whole-second mtime and ctime unchanged: only the
-# subsecond stat key can tell it moved. Each attempt starts on a second
-# boundary, rewrites once the first capture ran, and is retried only if the
-# rewrite still crossed into the next ctime second.
-ctime_second() { perl -e 'print +(stat shift)[10]' "$1"; }
-SAME_SECOND=
-for _ in 1 2 3; do
-  perl -MTime::HiRes=time,sleep -e 'sleep(1 - (time - int(time)))'
-  printf 'alpha\nbeta\n' > "$DELTA_HOME/$DELTA_LOG_REL"
-  BEFORE_SECOND=$(ctime_second "$DELTA_HOME/$DELTA_LOG_REL")
-  : > "$EXEC_LOG"
-  FM_TEST_EXEC_LOG="$EXEC_LOG" PATH="$DELTA_SHIM:/usr/bin:/bin" \
-    run_reader 11 "$PREFIX_SHA" 2 > "$TMP_ROOT/same-second.out" &
-  READER_PID=$!
-  for _ in $(seq 1 50); do grep -qx perl "$EXEC_LOG" && break; sleep 0.01; done
-  sleep 0.15
-  printf 'OMEGA\nbeta\n' > "$DELTA_HOME/$DELTA_LOG_REL"
-  AFTER_SECOND=$(ctime_second "$DELTA_HOME/$DELTA_LOG_REL")
-  RC=0
-  wait "$READER_PID" || RC=$?
-  [ "$BEFORE_SECOND" = "$AFTER_SECOND" ] || continue
-  SAME_SECOND=1
-  [ "$RC" -eq 0 ] || fail "the same-second rewrite read exited $RC instead of 0"
-  OUT=$(<"$TMP_ROOT/same-second.out")
-  assert_contains "$OUT" 'reason=prefix-changed' 'a same-second same-size rewrite was not detected'
-  break
+# Hold only the clock fields of the public stat interface inside one second.
+# File bytes, size, inode, device, capture and hashing remain real. A capture
+# handshake replaces a race against CI's scheduler, while the two keys prove
+# the test changes only fractional timestamps, never the coarse identity.
+CLOCK_SHIM="$TMP_ROOT/clock-shim"
+mkdir -p "$CLOCK_SHIM"
+cat > "$CLOCK_SHIM/stat" <<'SH'
+#!/bin/bash
+out=$(/usr/bin/stat "$@") || exit $?
+case "$*" in
+  *'%s:%.9Y:%.9Z:%i:%d'*|*'%z:%Fm:%Fc:%i:%d'*)
+    IFS=: read -r size _mtime _ctime inode device <<< "$out"
+    fraction=100000000
+    [ ! -f "$FM_TEST_CLOCK_CHANGED" ] || fraction=200000000
+    out="$size:1.$fraction:1.$fraction:$inode:$device"
+    printf '%s\n' "$out" >> "$FM_TEST_CLOCK_KEYS"
+    ;;
+esac
+printf '%s\n' "$out"
+SH
+cat > "$CLOCK_SHIM/perl" <<'SH'
+#!/bin/bash
+/usr/bin/perl "$@" || exit $?
+: > "$FM_TEST_CAPTURED"
+SH
+chmod +x "$CLOCK_SHIM/stat" "$CLOCK_SHIM/perl"
+printf 'alpha\nbeta\n' > "$DELTA_HOME/$DELTA_LOG_REL"
+FM_TEST_CLOCK_CHANGED="$TMP_ROOT/clock-changed" FM_TEST_CLOCK_KEYS="$TMP_ROOT/clock-keys" \
+  FM_TEST_CAPTURED="$TMP_ROOT/captured" PATH="$CLOCK_SHIM:/usr/bin:/bin" \
+  run_reader 11 "$PREFIX_SHA" 10 > "$TMP_ROOT/same-second.out" &
+READER_PID=$!
+for _ in $(seq 1 500); do
+  [ ! -f "$TMP_ROOT/captured" ] || break
+  sleep 0.01
 done
-[ -n "$SAME_SECOND" ] || fail 'no attempt landed the rewrite in the same ctime second'
+[ -f "$TMP_ROOT/captured" ] || fail 'initial same-second snapshot did not complete'
+printf 'OMEGA\nbeta\n' > "$DELTA_HOME/$DELTA_LOG_REL"
+: > "$TMP_ROOT/clock-changed"
+wait "$READER_PID" || fail 'same-second rewrite read failed'
+[ "$(sort -u "$TMP_ROOT/clock-keys" | wc -l | tr -d ' ')" = 2 ] \
+  || fail 'same-second fixture did not exercise two fractional timestamp keys'
+[ "$(cut -d: -f1,4,5 "$TMP_ROOT/clock-keys" | sort -u | wc -l | tr -d ' ')" = 1 ] \
+  || fail 'same-second fixture changed size, inode or device'
+OUT=$(<"$TMP_ROOT/same-second.out")
+assert_contains "$OUT" 'reason=prefix-changed' 'a same-second same-size rewrite was not detected'
 pass 'a same-second same-size rewrite of the same inode breaks continuity'
 
 # A log that disappears mid-wait breaks as missing only for a nonzero cursor.
 printf 'alpha\nbeta\n' > "$DELTA_HOME/$DELTA_LOG_REL"
-run_reader 11 "$PREFIX_SHA" 4 > "$TMP_ROOT/missing.out" &
+CAPTURE_SHIM="$TMP_ROOT/capture-shim"
+mkdir -p "$CAPTURE_SHIM"
+cp "$CLOCK_SHIM/perl" "$CAPTURE_SHIM/perl"
+FM_TEST_CAPTURED="$TMP_ROOT/missing-captured" PATH="$CAPTURE_SHIM:/usr/bin:/bin" \
+  run_reader 11 "$PREFIX_SHA" 10 > "$TMP_ROOT/missing.out" &
 READER_PID=$!
-sleep 0.3
+for _ in $(seq 1 500); do
+  [ ! -f "$TMP_ROOT/missing-captured" ] || break
+  sleep 0.01
+done
+[ -f "$TMP_ROOT/missing-captured" ] || fail 'initial missing-file snapshot did not complete'
 rm -f -- "$DELTA_HOME/$DELTA_LOG_REL"
 wait "$READER_PID" || fail 'the missing-file read did not exit 0'
 OUT=$(<"$TMP_ROOT/missing.out")

@@ -1455,6 +1455,20 @@ SH
   pass "returned custom check descendants are drained on installed and fallback timeout paths"
 }
 
+test_marker_cleanup_after_home_retirement() {
+  local state="$TMP_ROOT/retired-home/state"
+  mkdir -p "$state"
+  rmdir "$state" "${state%/state}"
+  fm_pr_poll_event_markers_remove "$state" ios \
+    || fail "marker cleanup refused a home already retired by remote teardown"
+  mkdir -p "${state%/state}"
+  ln -s "$TMP_ROOT/missing-marker-target" "$state"
+  if fm_pr_poll_event_markers_remove "$state" ios; then
+    fail "marker cleanup accepted a dangling state symlink"
+  fi
+  pass "marker cleanup is idempotent after home retirement but rejects dangling state links"
+}
+
 test_teardown_removes_poll_artifacts() {
   local dir fakebin artifact counterpart rc
   dir=$(make_case teardown-cleanup)
@@ -3626,4 +3640,5 @@ test_postrename_poll_validation_revokes_and_retries
 test_bootstrap_leaves_unauthenticated_checks
 test_custom_snapshot_cleanup_on_signal
 test_returned_custom_check_descendants_are_drained
+test_marker_cleanup_after_home_retirement
 test_teardown_removes_poll_artifacts
