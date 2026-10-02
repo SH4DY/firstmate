@@ -422,7 +422,7 @@ family_for_basename() {
     fm-claude-stop-autoarm.test.sh|fm-cursor-harness.test.sh|\
     fm-dispatch-resolve.test.sh|\
     fm-extension-binding.test.sh|fm-gitignore-config.test.sh|\
-    fm-no-mistakes-required.test.sh|fm-peek-remote.test.sh|\
+    fm-peek-remote.test.sh|\
     fm-pending-reply.test.sh|fm-pi-branch-extension.test.sh|\
     fm-procevent-quota.test.sh|fm-procevent-when.test.sh|fm-procevent.test.sh|\
     fm-live-gate.test.sh|\
@@ -780,7 +780,6 @@ tests/fm-mail.test.sh 9684
 tests/fm-muse-harness.test.sh 46548
 tests/fm-muse-signals-live-e2e.test.sh 52
 tests/fm-nm-test-contract.test.sh 853
-tests/fm-no-mistakes-required.test.sh 270
 tests/fm-omp-harness.test.sh 63796
 tests/fm-omp-primary-live-e2e.test.sh 74
 tests/fm-on.test.sh 11473
