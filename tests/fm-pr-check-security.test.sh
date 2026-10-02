@@ -8,6 +8,8 @@ set -u
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-pr-lib.sh"
 # shellcheck source=/dev/null
+. "$ROOT/bin/fm-pr-remediation-lib.sh"
+# shellcheck source=/dev/null
 . "$ROOT/bin/fm-check-lib.sh"
 
 PR_CHECK="$ROOT/bin/fm-pr-check.sh"

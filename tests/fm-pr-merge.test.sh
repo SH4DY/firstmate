@@ -3440,8 +3440,8 @@ test_allow_red_refused_on_gitlab() {
   rc=$?
   set -e
   expect_code 2 "$rc" "gitlab-allow-red: --allow-red must not apply on GitLab"
-  assert_grep '--allow-red does not apply to GitLab' "$case_dir/stderr" \
-    "gitlab-allow-red: refusal did not name GitLab"
+  assert_grep '--allow-red is forbidden' "$case_dir/stderr" \
+    "gitlab-allow-red: refusal did not name the absolute prohibition"
   [ ! -s "$case_dir/glab.log" ] || fail "gitlab-allow-red: glab ran despite --allow-red"
   pass "fm-pr-merge refuses --allow-red on GitLab"
 }
@@ -3832,7 +3832,7 @@ test_allow_missing_follows_the_allow_red_rules() {
   assert_grep '--allow-missing does not apply to GitLab' "$case_dir/stderr" \
     "gitlab-allow-missing: the refusal did not name GitLab"
   [ ! -s "$case_dir/glab.log" ] || fail "gitlab-allow-missing: glab ran despite the waiver"
-  pass "fm-pr-merge --allow-missing is single use, attended-only, and GitHub-only like --allow-red"
+  pass "fm-pr-merge --allow-missing is single use, attended-only, and GitHub-only; red waivers remain forbidden"
 }
 
 test_gitlab_head_override_args_refuse_before_recording

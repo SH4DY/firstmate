@@ -14,6 +14,8 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+# shellcheck source=bin/fm-pr-remediation-lib.sh
+. "$SCRIPT_DIR/fm-pr-remediation-lib.sh"
 
 if [ "$#" -ne 3 ]; then
   echo "error: invalid CI fix count request" >&2

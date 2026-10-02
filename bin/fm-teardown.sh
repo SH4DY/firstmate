@@ -329,6 +329,7 @@ for _teardown_source in \
   fm-classify-lib.sh \
   fm-gate-refuse-lib.sh \
   fm-pr-lib.sh \
+  fm-pr-remediation-lib.sh \
   fm-public-followup-lib.sh \
   fm-x-lib.sh \
   fm-env-lib.sh \
@@ -364,6 +365,8 @@ unset _teardown_source
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+# shellcheck source=bin/fm-pr-remediation-lib.sh
+. "$SCRIPT_DIR/fm-pr-remediation-lib.sh"
 # shellcheck source=bin/fm-public-followup-lib.sh
 . "$SCRIPT_DIR/fm-public-followup-lib.sh"
 # shellcheck source=bin/fm-secondmate-registry-lib.sh
