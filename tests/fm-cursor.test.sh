@@ -143,7 +143,11 @@ if [ -n "${FM_CURSOR_TEST_KEY:-}" ]; then
   done
 fi
 if [ -n "$cfg" ]; then
-  perms=$(stat -f '%Lp' "$cfg" 2>/dev/null || stat -c '%a' "$cfg" 2>/dev/null || echo unknown)
+  if [ "$(uname)" = Darwin ]; then
+    perms=$(stat -f '%Lp' "$cfg" 2>/dev/null || echo unknown)
+  else
+    perms=$(stat -c '%a' "$cfg" 2>/dev/null || echo unknown)
+  fi
   [ "$perms" = 600 ] || printf 'CFG_PERMS=%s\n' "$perms" >> "$FM_CURSOR_TEST_VIOLATIONS"
   grep -q "Authorization: Bearer ${FM_CURSOR_TEST_KEY}" "$cfg" \
     || printf 'CFG_MISSING_HEADER\n' >> "$FM_CURSOR_TEST_VIOLATIONS"
