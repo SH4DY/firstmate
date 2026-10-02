@@ -827,7 +827,6 @@ fm_pr_poll_snapshot_matches() {
   [ "$reg_identity" = "$FM_PR_POLL_SNAPSHOT_REG_IDENTITY" ]
 }
 
-
 fm_pr_poll_retirement_parse() {
   local file=$1 version id provider url host path number data_hash template_hash
   local data_identity check_identity reg_hash reg_identity result _extra

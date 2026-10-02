@@ -1458,16 +1458,20 @@ SH
 }
 
 test_marker_cleanup_after_home_retirement() {
-  local state="$TMP_ROOT/retired-home/state"
+  local state="$TMP_ROOT/retired-home/state" action
   mkdir -p "$state"
   rmdir "$state" "${state%/state}"
-  fm_pr_poll_event_markers_remove "$state" ios \
-    || fail "marker cleanup refused a home already retired by remote teardown"
+  for action in validate remove; do
+    "$ROOT/bin/fm-pr-remediation-cleanup.sh" "$action" "$state" ios \
+      || fail "$action refused a home already retired by remote teardown"
+  done
   mkdir -p "${state%/state}"
   ln -s "$TMP_ROOT/missing-marker-target" "$state"
-  if fm_pr_poll_event_markers_remove "$state" ios; then
-    fail "marker cleanup accepted a dangling state symlink"
-  fi
+  for action in validate remove; do
+    if "$ROOT/bin/fm-pr-remediation-cleanup.sh" "$action" "$state" ios; then
+      fail "$action accepted a dangling state symlink"
+    fi
+  done
   pass "marker cleanup is idempotent after home retirement but rejects dangling state links"
 }
 

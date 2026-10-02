@@ -330,6 +330,7 @@ for _teardown_source in \
   fm-gate-refuse-lib.sh \
   fm-pr-lib.sh \
   fm-pr-remediation-lib.sh \
+  fm-pr-remediation-cleanup.sh \
   fm-public-followup-lib.sh \
   fm-x-lib.sh \
   fm-env-lib.sh \
@@ -365,8 +366,6 @@ unset _teardown_source
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
-# shellcheck source=bin/fm-pr-remediation-lib.sh
-. "$SCRIPT_DIR/fm-pr-remediation-lib.sh"
 # shellcheck source=bin/fm-public-followup-lib.sh
 . "$SCRIPT_DIR/fm-public-followup-lib.sh"
 # shellcheck source=bin/fm-secondmate-registry-lib.sh
@@ -1415,17 +1414,13 @@ retire_busy_state() {
 }
 
 validate_pr_poll_cleanup() {
-  local state_dir=$1 id=$2 state_device artifact marker has_artifact=0
+  local state_dir=$1 id=$2 state_device artifact has_artifact=0
   fm_task_id_path_safe "$id" || return 0
+  "$SCRIPT_DIR/fm-pr-remediation-cleanup.sh" validate "$state_dir" "$id" || return 1
   for artifact in "$state_dir/$id.check.sh" "$state_dir/$id.pr-poll" \
     "$state_dir/$id.pr-poll-registration" "$state_dir/$id.pr-poll-retirement" \
     "$state_dir/$id.merge-authority" "$state_dir/$id.check-trust"; do
     [ -e "$artifact" ] || [ -L "$artifact" ] || continue
-    has_artifact=1
-  done
-  for marker in "$state_dir/$id.pr-ci-fix-count" \
-    "$state_dir/.pr-poll-event-$id-behind" "$state_dir/.pr-poll-event-$id-ci-"*; do
-    [ -e "$marker" ] || [ -L "$marker" ] || continue
     has_artifact=1
   done
   [ "$has_artifact" -eq 1 ] || return 0
@@ -1444,16 +1439,6 @@ validate_pr_poll_cleanup() {
       return 1
     fi
   done
-  if [ -e "$state_dir/$id.pr-ci-fix-count" ] || [ -L "$state_dir/$id.pr-ci-fix-count" ]; then
-    if ! fm_pr_ci_fix_count_file_valid "$state_dir/$id.pr-ci-fix-count" "$state_device"; then
-      echo "REFUSED: invalid CI fix count; preserving task state." >&2
-      return 1
-    fi
-  fi
-  if ! fm_pr_poll_event_markers_valid "$state_dir" "$id"; then
-    echo "REFUSED: unsafe PR-poll event marker; preserving task state." >&2
-    return 1
-  fi
   if [ -e "$state_dir/$id.pr-poll-retirement" ] \
     || [ -L "$state_dir/$id.pr-poll-retirement" ]; then
     fm_pr_poll_retirement_state_valid "$state_dir" "$id" || {
@@ -1471,8 +1456,7 @@ remove_pr_poll_artifacts() {
   rm -f "$state_dir/$id.check.sh" "$state_dir/$id.pr-poll" \
     "$state_dir/$id.pr-poll-registration" "$state_dir/$id.pr-poll-retirement" \
     "$state_dir/$id.merge-authority" "$state_dir/$id.check-trust" || return 1
-  fm_pr_poll_event_markers_remove "$state_dir" "$id" || return 1
-  fm_pr_ci_fix_count_remove "$state_dir" "$id" || return 1
+  "$SCRIPT_DIR/fm-pr-remediation-cleanup.sh" remove "$state_dir" "$id" || return 1
 }
 
 # Resolve the PR number for a worktree branch via gh-axi. Echoes the number on a
