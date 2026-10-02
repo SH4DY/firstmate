@@ -138,9 +138,8 @@ printf 'AgentScan E2E\n' > "$HOME_DIR/config/cursor-environment"
 
 REPO="$TMP_ROOT/repo"
 WT="$TMP_ROOT/wt-t1"
-BARE="$TMP_ROOT/origin.git"
+BARE="$REPO.origin.git"
 fm_git_worktree "$REPO" "$WT" fm/t1
-fm_git_add_origin "$REPO" "$BARE"
 git -C "$WT" push --quiet -u origin fm/t1
 
 fm_write_meta "$HOME_DIR/state/t1.meta" \
@@ -353,9 +352,8 @@ pass "bare-metal refuses a divergence rather than forcing over the cloud agent's
 # request. These use their own fixtures so t1's mutated end state cannot mask the
 # result.
 
-REPO2="$TMP_ROOT/repo2"; WT2="$TMP_ROOT/wt-t2"; BARE2="$TMP_ROOT/origin2.git"
+REPO2="$TMP_ROOT/repo2"; WT2="$TMP_ROOT/wt-t2"; BARE2="$REPO2.origin.git"
 fm_git_worktree "$REPO2" "$WT2" fm/t2
-fm_git_add_origin "$REPO2" "$BARE2"
 # Deliberately WITHOUT -u: this is the state the defect mishandled.
 git -C "$WT2" push --quiet origin fm/t2
 [ -z "$(git -C "$WT2" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)" ] \
